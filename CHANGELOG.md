@@ -3,6 +3,7 @@
 
 
 ##  Unreleased
+- `BackgroundWorker::perform_later` and `Queue::enqueue` now return `Result<Option<String>>` so callers can correlate the scheduled work (e.g. for status polling). The id is formatted as a ULID across every `WorkerMode`: `BackgroundQueue` returns the queue provider's ULID (queryable via `Queue::get_jobs`), while `ForegroundBlocking` and `BackgroundAsync` return a freshly generated ULID. Callers using `?` to discard the return value are unaffected.
 - Fix `cargo fmt` error in `loco-new` ([#1669](https://github.com/loco-rs/loco/pull/1669))
 - Fix UUID pattern in form field generation ([#1665](https://github.com/loco-rs/loco/pull/1665))
 - Add tests for auth extractor ([#1671](https://github.com/loco-rs/loco/pull/1671))
