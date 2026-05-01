@@ -358,7 +358,15 @@ impl Queue {
         Ok(())
     }
 
-    async fn get_jobs(
+    /// Retrieve jobs from the configured queue provider, optionally filtered
+    /// by status and/or age (in days). Useful for polling job status by id
+    /// returned from [`BackgroundWorker::perform_later`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying queue backend fails to retrieve
+    /// jobs, or if no queue provider is configured.
+    pub async fn get_jobs(
         &self,
         status: Option<&Vec<JobStatus>>,
         age_days: Option<i64>,

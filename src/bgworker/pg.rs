@@ -744,20 +744,26 @@ mod tests {
         );
 
         let job_data: JobData = serde_json::json!({"user_id": 1});
-        assert!(enqueue(
+        let job_id = enqueue(
             &pool,
             "PasswordChangeNotification",
             job_data,
             run_at,
             None,
-            None
+            None,
         )
         .await
-        .is_ok());
+        .expect("enqueue should succeed");
+        assert!(!job_id.is_empty(), "Job ID should not be empty");
+        assert!(
+            ulid::Ulid::from_string(&job_id).is_ok(),
+            "Job ID should be a valid ULID, got {job_id:?}"
+        );
 
         let jobs = get_all_jobs(&pool).await;
 
         assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, job_id);
         with_settings!({
                 filters => reduction().iter().map(|&(pattern, replacement)|
         (pattern, replacement)),     }, {

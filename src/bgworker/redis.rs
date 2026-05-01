@@ -1038,15 +1038,19 @@ mod tests {
 
         // Test enqueue
         let args = serde_json::json!({"user_id": 42});
+        let job_id = enqueue(&client, "PasswordReset".to_string(), None, args, None)
+            .await
+            .expect("enqueue should succeed");
+        assert!(!job_id.is_empty(), "Job ID should not be empty");
         assert!(
-            enqueue(&client, "PasswordReset".to_string(), None, args, None)
-                .await
-                .is_ok()
+            ulid::Ulid::from_string(&job_id).is_ok(),
+            "Job ID should be a valid ULID, got {job_id:?}"
         );
 
         // Verify job was created
         let jobs = get_all_jobs(&client).await;
         assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, job_id);
 
         let job = &jobs[0];
         assert_eq!(job.name, "PasswordReset");
