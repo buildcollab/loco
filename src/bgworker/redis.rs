@@ -264,7 +264,7 @@ pub async fn enqueue(
     queue: Option<String>,
     args: impl serde::Serialize + Send,
     tags: Option<Vec<String>>,
-) -> Result<()> {
+) -> Result<JobId> {
     let mut conn = get_connection(client).await?;
     let queue_name = queue.unwrap_or_else(|| "default".to_string());
     let queue_key = format!("{QUEUE_KEY_PREFIX}{queue_name}");
@@ -287,7 +287,7 @@ pub async fn enqueue(
     let _: () = conn.set(&job_key, &job_json).await?;
     let _: () = conn.rpush(&queue_key, &job.id).await?;
 
-    Ok(())
+    Ok(job_id)
 }
 
 const DEQUEUE_SCRIPT: &str = r#"
@@ -1038,15 +1038,19 @@ mod tests {
 
         // Test enqueue
         let args = serde_json::json!({"user_id": 42});
+        let job_id = enqueue(&client, "PasswordReset".to_string(), None, args, None)
+            .await
+            .expect("enqueue should succeed");
+        assert!(!job_id.is_empty(), "Job ID should not be empty");
         assert!(
-            enqueue(&client, "PasswordReset".to_string(), None, args, None)
-                .await
-                .is_ok()
+            ulid::Ulid::from_string(&job_id).is_ok(),
+            "Job ID should be a valid ULID, got {job_id:?}"
         );
 
         // Verify job was created
         let jobs = get_all_jobs(&client).await;
         assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, job_id);
 
         let job = &jobs[0];
         assert_eq!(job.name, "PasswordReset");

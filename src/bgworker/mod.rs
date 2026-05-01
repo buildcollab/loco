@@ -89,7 +89,11 @@ pub enum Queue {
 }
 
 impl Queue {
-    /// Add a job to the queue
+    /// Add a job to the queue.
+    ///
+    /// Returns the queue provider's job id when one is available
+    /// (Postgres, Sqlite, Redis). Returns `None` for the [`Queue::None`]
+    /// variant.
     ///
     /// # Errors
     ///
@@ -101,16 +105,17 @@ impl Queue {
         queue: Option<String>,
         args: A,
         tags: Option<Vec<String>>,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         tracing::debug!(worker = class, queue = ?queue, tags = ?tags, "Enqueuing background job");
         match self {
             #[cfg(feature = "bg_redis")]
             Self::Redis(pool, _, _, _) => {
-                redis::enqueue(pool, class, queue, args, tags).await?;
+                let id = redis::enqueue(pool, class, queue, args, tags).await?;
+                Ok(Some(id))
             }
             #[cfg(feature = "bg_pg")]
             Self::Postgres(pool, _, _, _) => {
-                pg::enqueue(
+                let id = pg::enqueue(
                     pool,
                     &class,
                     serde_json::to_value(args)?,
@@ -120,10 +125,11 @@ impl Queue {
                 )
                 .await
                 .map_err(Box::from)?;
+                Ok(Some(id))
             }
             #[cfg(feature = "bg_sqlt")]
             Self::Sqlite(pool, _, _, _) => {
-                sqlt::enqueue(
+                let id = sqlt::enqueue(
                     pool,
                     &class,
                     serde_json::to_value(args)?,
@@ -133,10 +139,10 @@ impl Queue {
                 )
                 .await
                 .map_err(Box::from)?;
+                Ok(Some(id))
             }
-            _ => {}
+            _ => Ok(None),
         }
-        Ok(())
     }
 
     /// Register a worker
@@ -352,7 +358,15 @@ impl Queue {
         Ok(())
     }
 
-    async fn get_jobs(
+    /// Retrieve jobs from the configured queue provider, optionally filtered
+    /// by status and/or age (in days). Useful for polling job status by id
+    /// returned from [`BackgroundWorker::perform_later`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying queue backend fails to retrieve
+    /// jobs, or if no queue provider is configured.
+    pub async fn get_jobs(
         &self,
         status: Option<&Vec<JobStatus>>,
         age_days: Option<i64>,
@@ -612,7 +626,26 @@ pub trait BackgroundWorker<A: Send + Sync + serde::Serialize + 'static>: Send + 
         let name = type_name.split("::").last().unwrap_or(type_name);
         name.to_upper_camel_case()
     }
-    async fn perform_later(ctx: &AppContext, args: A) -> crate::Result<()>
+    /// Schedule the worker to run.
+    ///
+    /// Returns an identifier for the scheduled work so callers can correlate
+    /// it (e.g. for status polling).
+    ///
+    /// * `BackgroundQueue` — returns the queue provider's job id, which is
+    ///   queryable via [`Queue::get_jobs`]. If the mode is selected but no
+    ///   provider is configured, `None` is returned and a warning is logged
+    ///   (the call is still considered successful, matching the previous
+    ///   degraded-mode behavior).
+    /// * `ForegroundBlocking` — generates a fresh ULID after the work
+    ///   completes. The id is not persisted anywhere because the job is
+    ///   already done.
+    /// * `BackgroundAsync` — returns the spawned `tokio::task::Id` formatted
+    ///   as a string. This is the actual id of the running task (handy for
+    ///   tracing / local debugging) and does not introduce a synthetic ULID
+    ///   that would not refer to anything real. The format intentionally
+    ///   differs from `BackgroundQueue`'s ULID; callers treating the id as
+    ///   opaque are unaffected.
+    async fn perform_later(ctx: &AppContext, args: A) -> crate::Result<Option<String>>
     where
         Self: Sized,
     {
@@ -622,27 +655,29 @@ pub trait BackgroundWorker<A: Send + Sync + serde::Serialize + 'static>: Send + 
                     let tags = Self::tags();
                     let tags_option = if tags.is_empty() { None } else { Some(tags) };
                     p.enqueue(Self::class_name(), Self::queue(), args, tags_option)
-                        .await?;
+                        .await
                 } else {
                     tracing::error!(
                         "perform_later: background queue is selected, but queue was not populated \
                          in context"
                     );
+                    Ok(None)
                 }
             }
             WorkerMode::ForegroundBlocking => {
                 Self::build(ctx).perform(args).await?;
+                Ok(Some(ulid::Ulid::new().to_string()))
             }
             WorkerMode::BackgroundAsync => {
                 let dx = ctx.clone();
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     if let Err(err) = Self::build(&dx).perform(args).await {
                         tracing::error!(err = err.to_string(), "worker failed to perform job");
                     }
                 });
+                Ok(Some(handle.id().to_string()))
             }
         }
-        Ok(())
     }
 
     async fn perform(&self, args: A) -> crate::Result<()>;
@@ -833,5 +868,106 @@ mod tests {
             .unwrap();
 
         assert_eq!(count, 14);
+    }
+
+    mod perform_later {
+        use std::sync::Arc;
+
+        use serde::{Deserialize, Serialize};
+
+        use super::*;
+        use crate::config::WorkerMode;
+
+        #[derive(Clone, Debug, Serialize, Deserialize)]
+        struct EmptyArgs;
+
+        struct TouchWorker {
+            touched: Arc<tokio::sync::Notify>,
+        }
+
+        #[async_trait]
+        impl BackgroundWorker<EmptyArgs> for TouchWorker {
+            fn build(ctx: &AppContext) -> Self {
+                Self {
+                    touched: ctx
+                        .shared_store
+                        .get::<Arc<tokio::sync::Notify>>()
+                        .expect("Notify is shared via shared_store in tests"),
+                }
+            }
+
+            async fn perform(&self, _args: EmptyArgs) -> crate::Result<()> {
+                self.touched.notify_one();
+                Ok(())
+            }
+        }
+
+        async fn ctx_with_mode(mode: WorkerMode) -> (AppContext, Arc<tokio::sync::Notify>) {
+            let mut ctx = tests_cfg::app::get_app_context().await;
+            ctx.config.workers.mode = mode;
+            ctx.queue_provider = None;
+            let notify = Arc::new(tokio::sync::Notify::new());
+            ctx.shared_store.insert(notify.clone());
+            (ctx, notify)
+        }
+
+        fn assert_is_ulid(id: &str) {
+            ulid::Ulid::from_string(id)
+                .unwrap_or_else(|err| panic!("expected a ULID id, got {id:?}: {err}"));
+        }
+
+        #[tokio::test]
+        async fn foreground_blocking_returns_ulid_and_runs_inline() {
+            let (ctx, notify) = ctx_with_mode(WorkerMode::ForegroundBlocking).await;
+
+            let id = TouchWorker::perform_later(&ctx, EmptyArgs)
+                .await
+                .expect("perform_later succeeds")
+                .expect("foreground mode returns an id");
+
+            assert_is_ulid(&id);
+            // ForegroundBlocking finishes the work before returning, so the
+            // notification must already be available.
+            tokio::time::timeout(std::time::Duration::from_millis(50), notify.notified())
+                .await
+                .expect("foreground worker ran inline");
+        }
+
+        #[tokio::test]
+        async fn background_async_returns_tokio_task_id_and_spawns() {
+            let (ctx, notify) = ctx_with_mode(WorkerMode::BackgroundAsync).await;
+
+            let id = TouchWorker::perform_later(&ctx, EmptyArgs)
+                .await
+                .expect("perform_later succeeds")
+                .expect("async mode returns an id");
+
+            // BackgroundAsync surfaces the real `tokio::task::Id` as a string
+            // rather than a synthetic ULID. The format is the integer-style
+            // tokio task id, so it must parse as a u64.
+            assert!(
+                id.parse::<u64>().is_ok(),
+                "expected a tokio::task::Id stringified to a u64, got {id:?}"
+            );
+            // The spawned task should run shortly after; wait briefly for it.
+            tokio::time::timeout(std::time::Duration::from_secs(1), notify.notified())
+                .await
+                .expect("spawned worker eventually runs");
+        }
+
+        #[tokio::test]
+        async fn background_queue_without_provider_logs_and_returns_none() {
+            let (ctx, _notify) = ctx_with_mode(WorkerMode::BackgroundQueue).await;
+
+            // No provider is set up; the call must succeed (preserving the
+            // pre-id-return degraded-mode behavior) and yield no id.
+            let id = TouchWorker::perform_later(&ctx, EmptyArgs)
+                .await
+                .expect("missing provider must not fail perform_later");
+            assert!(
+                id.is_none(),
+                "no id is available without a queue provider, got {id:?}"
+            );
+        }
     }
 }
