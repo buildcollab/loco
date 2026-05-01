@@ -1,14 +1,11 @@
-use sea_orm::{
-    sea_query::{IntoCondition, Order},
-    ColumnTrait, Condition, Value,
-};
+use sea_orm::{sea_query::Order, ColumnTrait, Condition, Value};
 use serde::{Deserialize, Serialize};
 
 mod date_range;
 
 // pub mod pagination;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ConditionBuilder {
     condition: Condition,
 }
@@ -164,9 +161,9 @@ pub fn date_range<T: ColumnTrait>(col: T) -> date_range::DateRangeBuilder<T> {
     date_range::DateRangeBuilder::new(condition(), col)
 }
 
-impl IntoCondition for ConditionBuilder {
-    fn into_condition(self) -> Condition {
-        self.build()
+impl From<ConditionBuilder> for Condition {
+    fn from(builder: ConditionBuilder) -> Self {
+        builder.condition
     }
 }
 
@@ -698,8 +695,8 @@ impl ConditionBuilder {
     }
 
     #[must_use]
-    pub fn build(&self) -> Condition {
-        self.condition.clone().into_condition()
+    pub fn build(self) -> Condition {
+        self.condition
     }
 }
 
