@@ -629,9 +629,7 @@ pub trait BackgroundWorker<A: Send + Sync + serde::Serialize + 'static>: Send + 
     /// Schedule the worker to run.
     ///
     /// Returns an identifier for the scheduled work so callers can correlate
-    /// it (e.g. for status polling). The id is intentionally formatted as a
-    /// ULID string in every mode so that switching `WorkerMode` does not
-    /// change the id format that callers see:
+    /// it (e.g. for status polling).
     ///
     /// * `BackgroundQueue` — returns the queue provider's job id, which is
     ///   queryable via [`Queue::get_jobs`]. If the mode is selected but no
@@ -641,10 +639,12 @@ pub trait BackgroundWorker<A: Send + Sync + serde::Serialize + 'static>: Send + 
     /// * `ForegroundBlocking` — generates a fresh ULID after the work
     ///   completes. The id is not persisted anywhere because the job is
     ///   already done.
-    /// * `BackgroundAsync` — generates a fresh ULID before spawning the
-    ///   tokio task. The id is not queryable via the queue provider, but the
-    ///   format matches the other modes so client code that parses ids will
-    ///   not break when the mode changes.
+    /// * `BackgroundAsync` — returns the spawned `tokio::task::Id` formatted
+    ///   as a string. This is the actual id of the running task (handy for
+    ///   tracing / local debugging) and does not introduce a synthetic ULID
+    ///   that would not refer to anything real. The format intentionally
+    ///   differs from `BackgroundQueue`'s ULID; callers treating the id as
+    ///   opaque are unaffected.
     async fn perform_later(ctx: &AppContext, args: A) -> crate::Result<Option<String>>
     where
         Self: Sized,
@@ -669,14 +669,13 @@ pub trait BackgroundWorker<A: Send + Sync + serde::Serialize + 'static>: Send + 
                 Ok(Some(ulid::Ulid::new().to_string()))
             }
             WorkerMode::BackgroundAsync => {
-                let id = ulid::Ulid::new().to_string();
                 let dx = ctx.clone();
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     if let Err(err) = Self::build(&dx).perform(args).await {
                         tracing::error!(err = err.to_string(), "worker failed to perform job");
                     }
                 });
-                Ok(Some(id))
+                Ok(Some(handle.id().to_string()))
             }
         }
     }
@@ -935,7 +934,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn background_async_returns_ulid_and_spawns() {
+        async fn background_async_returns_tokio_task_id_and_spawns() {
             let (ctx, notify) = ctx_with_mode(WorkerMode::BackgroundAsync).await;
 
             let id = TouchWorker::perform_later(&ctx, EmptyArgs)
@@ -943,7 +942,13 @@ mod tests {
                 .expect("perform_later succeeds")
                 .expect("async mode returns an id");
 
-            assert_is_ulid(&id);
+            // BackgroundAsync surfaces the real `tokio::task::Id` as a string
+            // rather than a synthetic ULID. The format is the integer-style
+            // tokio task id, so it must parse as a u64.
+            assert!(
+                id.parse::<u64>().is_ok(),
+                "expected a tokio::task::Id stringified to a u64, got {id:?}"
+            );
             // The spawned task should run shortly after; wait briefly for it.
             tokio::time::timeout(std::time::Duration::from_secs(1), notify.notified())
                 .await

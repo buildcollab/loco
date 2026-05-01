@@ -147,11 +147,15 @@ To use a worker, we mainly think about adding a job to the queue, so you `use` t
     )
     .await?;
 
-    // The id is a ULID-formatted string and can be persisted so the
-    // frontend can poll for status. `Some(id)` is returned in every mode
-    // (BackgroundQueue / ForegroundBlocking / BackgroundAsync); `None` is
-    // only returned when BackgroundQueue is selected but no queue provider
-    // is configured (the call still succeeds and is logged).
+    // The id can be persisted so the frontend can poll for status.
+    // Format depends on `WorkerMode`:
+    //   * BackgroundQueue   - the queue provider's ULID (queryable via
+    //                         `Queue::get_jobs`).
+    //   * ForegroundBlocking - a fresh ULID; the work is already done.
+    //   * BackgroundAsync   - the spawned `tokio::task::Id` formatted as a
+    //                         string. Useful for tracing / local debugging.
+    // `None` is only returned when BackgroundQueue is selected but no
+    // queue provider is configured (the call still succeeds and is logged).
     if let Some(id) = job_id {
         tracing::info!(job_id = %id, "queued job");
     }
@@ -240,7 +244,7 @@ The `BackgroundWorker` trait is the core interface for defining background worke
 - `queue() -> Option<String>`: Optional method to specify a custom queue for the worker (returns `None` by default).
 - `tags() -> Vec<String>`: Optional method to specify tags for this worker (returns an empty vector by default).
 - `class_name() -> String`: Returns the worker's class name (automatically derived from the struct name).
-- `perform_later(ctx: &AppContext, args: A) -> Result<Option<String>>`: Static method to enqueue a job to be performed later. Returns `Some(job_id)` formatted as a ULID in every `WorkerMode` so callers can correlate the work; `None` is only returned when `BackgroundQueue` is configured without a provider (the call still succeeds and the failure is logged).
+- `perform_later(ctx: &AppContext, args: A) -> Result<Option<String>>`: Static method to enqueue a job to be performed later. Returns `Some(job_id)` whose format depends on `WorkerMode`: `BackgroundQueue` returns the queue provider's ULID (queryable via `Queue::get_jobs`), `ForegroundBlocking` returns a fresh ULID, and `BackgroundAsync` returns the spawned `tokio::task::Id` as a string. `None` is only returned when `BackgroundQueue` is configured without a provider (the call still succeeds and the failure is logged).
 
 ### Generate a Worker
 
