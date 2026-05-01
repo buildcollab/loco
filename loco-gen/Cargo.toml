@@ -26,13 +26,13 @@ colored = { workspace = true }
 heck = { workspace = true }
 tera = { workspace = true }
 duct = { workspace = true }
-clap = { version = "4.4.7", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
 include_dir = { version = "0.7.4" }
 
 [dev-dependencies]
 tree-fs = { version = "0.3" }
 syn = { version = "2", features = ["full"] }
-serial_test = "3.1.1"
-uuid = { version = "1.11.0", features = ["v4", "fast-rng"] }
-insta = { version = "1.41.1", features = ["redactions", "yaml", "filters"] }
-rstest = "0.23.0"
+serial_test = "3.4"
+uuid = { version = "1.23", features = ["v4", "fast-rng"] }
+insta = { version = "1.47", features = ["redactions", "yaml", "filters"] }
+rstest = "0.26"
