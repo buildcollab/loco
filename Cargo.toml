@@ -29,6 +29,10 @@ default = [
     "bg_redis",
     "bg_pg",
     "bg_sqlt",
+    "cable_redis",
+    "cable_pg",
+    "cable_sqlt",
+    "cable_pgmq",
 ]
 auth_jwt = ["dep:jsonwebtoken"]
 cli = ["dep:clap"]
@@ -50,6 +54,11 @@ cache_redis = ["dep:bb8-redis", "dep:bb8"]
 bg_redis = ["dep:redis"]
 bg_pg = ["dep:sqlx"]
 bg_sqlt = ["dep:sqlx"]
+# Realtime cable (pub/sub for WebSocket / SSE)
+cable_redis = ["dep:redis"]
+cable_pg = ["dep:sqlx"]
+cable_sqlt = ["dep:sqlx"]
+cable_pgmq = ["dep:sqlx", "dep:pgmq"]
 ## Testing feature flags
 integration_test = []
 # Embed assets into binary
@@ -156,6 +165,9 @@ ulid = { version = "1" }
 # bg_redis: redis workers
 redis = { version = "1.2", features = ["aio", "tokio-comp"], optional = true }
 
+# cable_pgmq: PostgreSQL Message Queue backend for realtime cable
+pgmq = { version = "0.33", optional = true }
+
 scraper = { version = "0.25.0", features = ["deterministic"], optional = true }
 
 dashmap = "6"
@@ -171,7 +183,7 @@ thiserror = "2"
 serde = "1"
 serde_json = "1"
 async-trait = { version = "0.1.89" }
-axum = { version = "0.8.9", features = ["macros", "multipart"] }
+axum = { version = "0.8.9", features = ["macros", "multipart", "ws"] }
 tower = "0.5"
 tower-http = { version = "0.6.8", features = [
     "trace",

@@ -123,6 +123,11 @@ gen.copy_dir("tests/workers");                   // Workers test directory
 gen.copy_file("src/workers/downloader.rs");
 
 // =====================
+// Realtime cable channels (WebSocket / SSE)
+// =====================
+gen.copy_template("src/channels/mod.rs.t");      // Channels module placeholder
+
+// =====================
 // Server side
 // =====================
 if settings.asset?.is_server_side ?? false {

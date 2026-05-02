@@ -1,4 +1,5 @@
 pub use async_trait::async_trait;
+pub use bytes;
 pub use axum::{
     debug_handler,
     extract::{Form, Multipart, Path, Query, State},
@@ -31,6 +32,7 @@ pub use crate::model::{query, Authenticable, ModelError, ModelResult};
 pub use crate::{
     app::{AppContext, Initializer},
     bgworker::{BackgroundWorker, Queue},
+    cable::{Cable, Channel, ChannelRegistry, PubSub},
     controller::{
         bad_request, format,
         middleware::{

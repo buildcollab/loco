@@ -29,6 +29,7 @@ pub fn test_config() -> Config {
         #[cfg(feature = "with-db")]
         database: get_database_config(),
         queue: None,
+        cable: None,
         auth: None,
         workers: config::Workers {
             mode: config::WorkerMode::ForegroundBlocking,

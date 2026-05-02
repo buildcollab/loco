@@ -290,6 +290,10 @@ pub enum Component {
         /// Name of the thing to generate
         name: String,
     },
+    Channel {
+        /// Name of the thing to generate
+        name: String,
+    },
     Mailer {
         /// Name of the thing to generate
         name: String,
@@ -361,6 +365,10 @@ pub fn generate(rrgen: &RRgen, component: Component, appinfo: &AppInfo) -> Resul
         Component::Worker { name } => {
             let vars = json!({"name": name, "pkg_name": appinfo.app_name});
             render_template(rrgen, Path::new("worker"), &vars)?
+        }
+        Component::Channel { name } => {
+            let vars = json!({"name": name, "pkg_name": appinfo.app_name});
+            render_template(rrgen, Path::new("channel"), &vars)?
         }
         Component::Mailer { name } => {
             let vars = json!({ "name": name });

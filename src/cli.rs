@@ -333,6 +333,11 @@ After running the migration, follow these steps to complete the process:
         /// Name of the thing to generate
         name: String,
     },
+    /// Generate a realtime cable channel (WebSocket / SSE)
+    Channel {
+        /// Name of the thing to generate
+        name: String,
+    },
     /// Generate mailer
     Mailer {
         /// Name of the thing to generate
@@ -461,6 +466,7 @@ impl ComponentArg {
             Self::Task { name } => Ok(loco_gen::Component::Task { name }),
             Self::Scheduler {} => Ok(loco_gen::Component::Scheduler {}),
             Self::Worker { name } => Ok(loco_gen::Component::Worker { name }),
+            Self::Channel { name } => Ok(loco_gen::Component::Channel { name }),
             Self::Mailer { name } => Ok(loco_gen::Component::Mailer { name }),
             Self::Data { name } => Ok(loco_gen::Component::Data { name }),
             Self::Deployment { kind } => Ok(kind.to_generator_component(config)),

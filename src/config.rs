@@ -52,6 +52,10 @@ pub struct Config {
     #[serde(default)]
     pub cache: CacheConfig,
     pub queue: Option<QueueConfig>,
+    /// Realtime pub/sub ("cable") backend used by WebSocket / SSE channels.
+    /// When `None`, no cable provider is created and `AppContext.cable` is
+    /// `None`.
+    pub cable: Option<CableConfig>,
     pub auth: Option<Auth>,
     #[serde(default)]
     pub workers: Workers,
@@ -382,6 +386,89 @@ fn sqlt_poll_interval() -> u32 {
 
 fn num_workers() -> u32 {
     2
+}
+
+/// Realtime pub/sub backend configuration ("cable").
+///
+/// Mirrors the `QueueConfig` shape so users can pick the backend at config
+/// time without touching code. Use `InMem` for single-process dev / tests,
+/// `Postgres` / `Sqlite` for "no Redis required" deployments,
+/// `Redis` for native pub/sub fan-out, or `PgMQ` to ride on top of the
+/// `pgmq` Postgres extension.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "kind")]
+pub enum CableConfig {
+    /// Process-local pub/sub (no persistence). Backed by
+    /// `tokio::sync::broadcast`. Single-node only.
+    InMem,
+    /// Postgres-backed pub/sub via a polled `loco_cable_messages` table.
+    Postgres(PostgresCableConfig),
+    /// SQLite-backed pub/sub via a polled `loco_cable_messages` table.
+    Sqlite(SqliteCableConfig),
+    /// Redis-native pub/sub. Multi-node fan-out, no polling.
+    Redis(RedisCableConfig),
+    /// Postgres Message Queue (`pgmq` extension) backed pub/sub.
+    PgMQ(PgMQCableConfig),
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PostgresCableConfig {
+    pub uri: String,
+    /// Polling interval (ms). Defaults to 100 to match Solid Cable.
+    #[serde(default = "cable_poll_interval_ms")]
+    pub polling_interval_ms: u64,
+    /// Retain delivered rows for this many minutes before they're cleaned up
+    /// by the polling task. Defaults to 60.
+    #[serde(default = "cable_retention_minutes")]
+    pub retention_minutes: u32,
+    #[serde(default)]
+    pub dangerously_flush: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SqliteCableConfig {
+    pub uri: String,
+    #[serde(default = "cable_poll_interval_ms")]
+    pub polling_interval_ms: u64,
+    #[serde(default = "cable_retention_minutes")]
+    pub retention_minutes: u32,
+    #[serde(default)]
+    pub dangerously_flush: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RedisCableConfig {
+    pub uri: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PgMQCableConfig {
+    pub uri: String,
+    /// Visibility timeout for `pgmq.read` (seconds). Defaults to 30.
+    #[serde(default = "pgmq_visibility_timeout")]
+    pub visibility_timeout_sec: i32,
+    /// How many messages to read per poll. Defaults to 10.
+    #[serde(default = "pgmq_batch_size")]
+    pub batch_size: i32,
+    /// Polling interval (ms) for the per-subscription read loop. Defaults to 100.
+    #[serde(default = "cable_poll_interval_ms")]
+    pub polling_interval_ms: u64,
+}
+
+fn cable_poll_interval_ms() -> u64 {
+    100
+}
+
+fn cable_retention_minutes() -> u32 {
+    60
+}
+
+fn pgmq_visibility_timeout() -> i32 {
+    30
+}
+
+fn pgmq_batch_size() -> i32 {
+    10
 }
 
 /// User authentication configuration.
