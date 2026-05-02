@@ -17,6 +17,7 @@ use dashmap::DashMap;
 use crate::{
     bgworker::{self, Queue},
     boot::{shutdown_signal, BootResult, ServeParams, StartMode},
+    cable::{Cable, ChannelRegistry},
     cache::{self},
     config::Config,
     controller::{
@@ -260,6 +261,9 @@ pub struct AppContext {
     pub db: DatabaseConnection,
     /// Queue provider
     pub queue_provider: Option<Arc<bgworker::Queue>>,
+    /// Realtime pub/sub provider for WebSocket / SSE channels.
+    /// `None` when no `cable` section is configured.
+    pub cable: Option<Cable>,
     /// Configuration settings for the application
     pub config: Config,
     /// An optional email sender component that can be used to send email.
@@ -420,6 +424,17 @@ pub trait Hooks: Send {
     /// Connects custom workers to the application using the provided
     /// [`Processor`] and [`AppContext`].
     async fn connect_workers(ctx: &AppContext, queue: &Queue) -> Result<()>;
+
+    /// Registers realtime cable channels (`Channel` implementations) into
+    /// the provided [`ChannelRegistry`]. Each entry is keyed by a stable
+    /// name used by the WS / SSE transports to look up the channel at
+    /// connection time.
+    ///
+    /// Default implementation is a no-op so apps that don't use cable
+    /// don't need to override.
+    async fn register_channels(_ctx: &AppContext, _registry: &mut ChannelRegistry) -> Result<()> {
+        Ok(())
+    }
 
     /// Registers custom tasks with the provided [`Tasks`] object.
     fn register_tasks(tasks: &mut Tasks);

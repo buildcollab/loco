@@ -374,11 +374,13 @@ pub async fn create_context<H: Hooks>(
     };
 
     let queue_provider = bgworker::create_queue_provider(&config).await?;
+    let cable = crate::cable::create_provider(&config).await?;
     let ctx = AppContext {
         environment: environment.clone(),
         #[cfg(feature = "with-db")]
         db,
         queue_provider,
+        cable,
         storage: Storage::single(storage::drivers::null::new()).into(),
         cache: cache::create_cache_provider(&config).await?,
         config,
@@ -440,6 +442,15 @@ pub async fn run_app<H: Hooks>(mode: &StartMode, app_context: AppContext) -> Res
 
     for initializer in &initializers {
         initializer.before_run(&app_context).await?;
+    }
+
+    let mut channel_registry = crate::cable::ChannelRegistry::new();
+    H::register_channels(&app_context, &mut channel_registry).await?;
+    if !channel_registry.is_empty() {
+        info!(
+            channels = ?channel_registry.names().collect::<Vec<_>>(),
+            "cable channels registered"
+        );
     }
 
     match mode {

@@ -44,6 +44,8 @@ For a deeper dive into how Loco works, including detailed guides, examples, and 
 
 * `Mailers:` A mailer will deliver emails in the background using the existing loco background worker infrastructure. It will all be seamless for you.
 
+* `Realtime (Cable):` First-class WebSocket and SSE channels with a pluggable pub/sub backend (in-memory, Postgres, SQLite, Redis, or `pgmq`). Publish from anywhere — controllers, workers, tasks — and any subscribed client receives the payload.
+
 * `Storage:` In Loco Storage, we facilitate working with files through multiple operations. Storage can be in-memory, on disk, or use cloud services such as AWS S3, GCP, and Azure.
 
 * `Cache:` Loco provides an cache layer to improve application performance by storing frequently accessed data.

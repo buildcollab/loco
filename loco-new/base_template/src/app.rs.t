@@ -10,6 +10,7 @@ use loco_rs::{
         {%- endif %}
         Queue},
     boot::{create_app, BootResult, StartMode},
+    cable::ChannelRegistry,
     config::Config,
     controller::AppRoutes,
     {%- if settings.auth %}
@@ -83,10 +84,18 @@ impl Hooks for App {
     async fn connect_workers(ctx: &AppContext, queue: &Queue) -> Result<()> {
     {%- else %}
     async fn connect_workers(_ctx: &AppContext, _queue: &Queue) -> Result<()> {
-    {%- endif %} 
+    {%- endif %}
         {%- if settings.background %}
         queue.register(DownloadWorker::build(ctx)).await?;
         {%- endif %}
+        Ok(())
+    }
+
+    /// Register realtime cable channels. Use `cargo loco generate channel <name>`
+    /// to add a new one — the generator injects a `registry.register(...)` line
+    /// after the marker below.
+    async fn register_channels(_ctx: &AppContext, _registry: &mut ChannelRegistry) -> Result<()> {
+        // channels-inject (do not remove)
         Ok(())
     }
 

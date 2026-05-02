@@ -3,6 +3,7 @@
 
 
 ##  Unreleased
+- Add `loco_rs::cable` — realtime pub/sub for WebSocket / SSE channels (Loco's equivalent of Solid Cable). New `Cable` handle on `AppContext`, `Channel` trait + `ChannelRegistry`, Axum WS / SSE bridges (`cable::transport`), `Hooks::register_channels` (default no-op), and a `cargo loco generate channel <name>` template. Five backends behind feature flags (all in `default` except InMem which is always-on): `cable_pg`, `cable_sqlt`, `cable_redis`, `cable_pgmq`, plus the always-on InMem `tokio::sync::broadcast` provider. New `cable: Option<CableConfig>` section on `Config`. Docs at `docs/processing/cable.md`.
 - `BackgroundWorker::perform_later` and `Queue::enqueue` now return `Result<Option<String>>` so callers can correlate the scheduled work (e.g. for status polling). The id format depends on the `WorkerMode`: `BackgroundQueue` returns the queue provider's ULID (queryable via `Queue::get_jobs`); `ForegroundBlocking` returns a fresh ULID after the work has run; `BackgroundAsync` returns the spawned `tokio::task::Id` as a string (useful for tracing / local debugging — the id is real, not a synthetic ULID). Callers using `?` to discard the return value are unaffected.
 - Fix `cargo fmt` error in `loco-new` ([#1669](https://github.com/loco-rs/loco/pull/1669))
 - Fix UUID pattern in form field generation ([#1665](https://github.com/loco-rs/loco/pull/1665))

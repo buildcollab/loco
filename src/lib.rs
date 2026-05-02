@@ -24,6 +24,7 @@ mod tera;
 pub mod app;
 pub mod auth;
 pub mod boot;
+pub mod cable;
 pub mod cache;
 #[cfg(feature = "cli")]
 pub mod cli;
