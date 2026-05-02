@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -106,6 +107,45 @@ pub trait StoreDriver: Sync + Send {
     /// Returns a `StorageResult` with a boolean indicating the existence of the
     /// content.
     async fn exists(&self, path: &Path) -> StorageResult<bool>;
+
+    /// Returns a URL clients can `GET` to read the object at `path` —
+    /// signed with a TTL when the underlying store supports it (S3, GCS,
+    /// Azure), or a public/local-fs URL otherwise.
+    ///
+    /// Drivers that don't expose any addressable URL must return
+    /// [`StorageError::NotSupported`] so callers can fall back to
+    /// proxying bytes through their own controller.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::NotSupported`] for backends without a
+    /// URL concept (in-memory, null) and propagates underlying signing
+    /// errors otherwise.
+    async fn presign_read(
+        &self,
+        _path: &Path,
+        _expire: Duration,
+    ) -> StorageResult<String> {
+        Err(super::StorageError::NotSupported)
+    }
+
+    /// Returns a presigned URL clients can `PUT` to upload bytes
+    /// directly. Used for browser → S3 direct uploads. Drivers that
+    /// don't support direct uploads must return
+    /// [`StorageError::NotSupported`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::NotSupported`] for backends without
+    /// presigned-PUT support (local fs, in-memory, null) and propagates
+    /// underlying signing errors otherwise.
+    async fn presign_write(
+        &self,
+        _path: &Path,
+        _expire: Duration,
+    ) -> StorageResult<String> {
+        Err(super::StorageError::NotSupported)
+    }
 
     /// Retrieves content from the specified path and returns it as a stream.
     /// This method is more memory-efficient than `get()` for large files as it
