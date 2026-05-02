@@ -218,7 +218,7 @@ loco-rs = { path = ".", features = ["testing"] }
 rstest = "0.26"
 insta = { version = "1.47", features = ["redactions", "yaml", "filters"] }
 tree-fs = { version = "0.3" }
-reqwest = { version = "0.12.28", features = ["json"] }
+reqwest = { version = "0.12.28", features = ["json", "stream"] }
 tower = { workspace = true, features = ["util"] }
 sqlx = { version = "0.8.6", default-features = false, features = [
     "macros",
@@ -229,3 +229,4 @@ sqlx = { version = "0.8.6", default-features = false, features = [
     "migrate",
 ] }
 testcontainers = { version = "0.27" }
+tokio-tungstenite = "0.27"
