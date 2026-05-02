@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -178,5 +179,63 @@ impl StoreDriver for OpendalAdapter {
             e_tag: meta.etag().map(std::string::ToString::to_string),
             version: meta.version().map(std::string::ToString::to_string),
         })
+    }
+
+    /// Returns a signed/public URL for the object at `path`. Backed by
+    /// OpenDAL's native `presign_read`, which works for S3, GCS, Azure
+    /// and any other driver advertising `presign_read` capability.
+    /// Drivers that don't (local fs, in-memory) error
+    /// [`StorageError::NotSupported`].
+    async fn presign_read(&self, path: &Path, expire: Duration) -> StorageResult<String> {
+        if !self.opendal_impl.info().full_capability().presign_read {
+            return Err(StorageError::NotSupported);
+        }
+        let presigned = self
+            .opendal_impl
+            .presign_read(&path.display().to_string(), expire)
+            .await?;
+        Ok(presigned.uri().to_string())
+    }
+
+    /// Returns a presigned PUT URL clients can upload bytes to directly,
+    /// via OpenDAL's `presign_write`. Drivers that don't support direct
+    /// uploads error [`StorageError::NotSupported`].
+    async fn presign_write(&self, path: &Path, expire: Duration) -> StorageResult<String> {
+        if !self.opendal_impl.info().full_capability().presign_write {
+            return Err(StorageError::NotSupported);
+        }
+        let presigned = self
+            .opendal_impl
+            .presign_write(&path.display().to_string(), expire)
+            .await?;
+        Ok(presigned.uri().to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::{drivers::mem, StorageError};
+
+    #[tokio::test]
+    async fn presign_read_errors_not_supported_for_in_memory_driver() {
+        // The memory driver doesn't expose any URL surface — callers
+        // must proxy bytes through their own controller.
+        let driver = mem::new();
+        let err = driver
+            .presign_read(Path::new("nope"), Duration::from_secs(60))
+            .await
+            .expect_err("mem driver shouldn't support presign_read");
+        assert!(matches!(err, StorageError::NotSupported));
+    }
+
+    #[tokio::test]
+    async fn presign_write_errors_not_supported_for_in_memory_driver() {
+        let driver = mem::new();
+        let err = driver
+            .presign_write(Path::new("nope"), Duration::from_secs(60))
+            .await
+            .expect_err("mem driver shouldn't support presign_write");
+        assert!(matches!(err, StorageError::NotSupported));
     }
 }

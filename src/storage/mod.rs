@@ -40,6 +40,9 @@ pub enum StorageError {
 
     #[error(transparent)]
     Any(#[from] Box<dyn std::error::Error + Send + Sync>),
+
+    #[error("operation is not supported by this storage driver")]
+    NotSupported,
 }
 
 pub type StorageResult<T> = std::result::Result<T, StorageError>;
@@ -209,6 +212,52 @@ impl Storage {
     /// is an issue with the strategy configuration.
     pub async fn delete(&self, path: &Path) -> StorageResult<()> {
         self.delete_with_policy(path, &*self.strategy).await
+    }
+
+    /// Returns a URL clients can `GET` to read the object at `path`,
+    /// signed with `expire` TTL when the underlying driver supports
+    /// presigning (S3, GCS, Azure). For drivers without a URL concept
+    /// (in-memory, null), returns [`StorageError::NotSupported`] so the
+    /// caller can fall back to proxying bytes.
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors from the primary store's
+    /// [`StoreDriver::presign_read`] (or `NotSupported`).
+    pub async fn presign_read(
+        &self,
+        path: &Path,
+        expire: std::time::Duration,
+    ) -> StorageResult<String> {
+        self.primary_store()?.presign_read(path, expire).await
+    }
+
+    /// Returns a presigned PUT URL clients can upload bytes to
+    /// directly. See [`StoreDriver::presign_write`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors from the primary store's
+    /// [`StoreDriver::presign_write`] (or `NotSupported`).
+    pub async fn presign_write(
+        &self,
+        path: &Path,
+        expire: std::time::Duration,
+    ) -> StorageResult<String> {
+        self.primary_store()?.presign_write(path, expire).await
+    }
+
+    /// Returns the first store in the map. Storage built via
+    /// [`Storage::single`] always has exactly one store; multi-store
+    /// strategies pick the first key insertion order, which for
+    /// `BTreeMap` is alphabetical by name.
+    fn primary_store(&self) -> StorageResult<&dyn StoreDriver> {
+        let (_, store) = self
+            .stores
+            .iter()
+            .next()
+            .ok_or_else(|| StorageError::StoreNotFound("no stores configured".into()))?;
+        Ok(&**store)
     }
 
     /// Deletes content from the storage at the specified path using a specific
