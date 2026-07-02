@@ -1,0 +1,21 @@
+---
+source: loco-gen/tests/templates/agent.rs
+expression: collect_messages(&gen_result)
+---
+* Agent controller `agents` was added.
+
+Next steps:
+  1. Enable the `agui` feature on loco-rs in Cargo.toml:
+       loco-rs = { version = "*", features = ["agui"] }
+  2. Run the migration + entity sync:
+       $ cargo loco db migrate && cargo loco db entities
+  3. Set your OpenRouter key in the environment:
+       export OPENROUTER_API_KEY=sk-or-...
+  4. Seed an `agents` row (name, provider, model, system_prompt) and POST to
+       /api/conversations/{conversation_pid}/run
+     with an AG-UI `RunAgentInput` body to stream a response.
+
+This file is a starting point — customize the tools in `AgentTools`, the
+system-prompt assembly, and the message-history mapping to fit your app.
+
+* Agent migration added! Apply it with `$ cargo loco db migrate && cargo loco db entities`.

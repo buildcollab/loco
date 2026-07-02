@@ -40,6 +40,7 @@ testing = ["dep:axum-test", "dep:scraper", "dep:tree-fs"]
 with-db = [
     "dep:sea-orm",
     "dep:sea-orm-migration",
+    "dep:sea-schema",
     "dep:sqlx",
     "loco-gen/with-db",
 ]
@@ -59,6 +60,8 @@ cable_redis = ["dep:redis"]
 cable_pg = ["dep:sqlx"]
 cable_sqlt = ["dep:sqlx"]
 cable_pgmq = ["dep:sqlx", "dep:pgmq"]
+# AG-UI streaming agent runtime (LLM agents over SSE). Off by default.
+agui = ["dep:reqwest", "tokio/sync", "tokio/rt", "tokio/macros"]
 ## Testing feature flags
 integration_test = []
 # Embed assets into binary
@@ -77,6 +80,11 @@ sea-orm = { version = "2.0.0-rc.19", features = [
     "runtime-tokio-rustls",
     "macros",
 ], optional = true }
+# Transitive pin (pulled via sea-orm-migration, not used directly). sea-orm
+# rc.41's `sea_schema_shim` implements `sea_schema::Connection` with `?Send`,
+# which only matches sea-schema 0.18.0's trait; 0.18.1 made the trait `Send`
+# under sqlx, so the shim fails to compile on newer rustc. Pin to 0.18.0.
+sea-schema = { version = "=0.18.0", optional = true }
 
 tokio = { version = "1.52", default-features = false }
 tokio-util = "0.7"
@@ -169,6 +177,13 @@ redis = { version = "1.2", features = ["aio", "tokio-comp"], optional = true }
 pgmq = { version = "0.33", optional = true }
 
 scraper = { version = "0.25.0", features = ["deterministic"], optional = true }
+
+# agui: HTTP client for the OpenAI-compatible LLM provider (SSE streaming)
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+    "stream",
+], optional = true }
 
 dashmap = "6"
 notify = "8.2"

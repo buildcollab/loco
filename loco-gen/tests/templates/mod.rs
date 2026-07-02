@@ -1,3 +1,5 @@
+#[cfg(feature = "with-db")]
+mod agent;
 mod controller;
 mod deployment;
 mod mailer;
