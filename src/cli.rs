@@ -287,9 +287,23 @@ After running the migration, follow these steps to complete the process:
         #[clap(long, group = "scaffold_kind_group")]
         api: bool,
     },
+    #[cfg(feature = "with-db")]
+    /// Generate an AG-UI agent subsystem (migration + streaming chat controller)
+    #[command(after_help = format!("{}
+ $ cargo loco generate agent
+
+Scaffolds the `agents`, `agent_modes`, `conversations`, `messages`, \
+`tool_calls`, and `context_items` tables plus a controller that streams agent \
+responses over the AG-UI protocol using `loco_rs::agui` (enable the `agui` \
+feature on loco-rs).", "Examples:".bold().underline()))]
+    Agent {
+        /// Generate without timestamps (`created_at`, `updated_at` columns)
+        #[arg(long, action)]
+        without_tz: bool,
+    },
     /// Generate a new controller with the given controller name, and test file.
     #[command(after_help = format!(
-    "{}  
+    "{}
   - Generate an empty controller:
       $ cargo loco generate controller posts --api
 
@@ -435,6 +449,10 @@ impl ComponentArg {
                     kind,
                 })
             }
+            #[cfg(feature = "with-db")]
+            Self::Agent { without_tz } => Ok(loco_gen::Component::Agent {
+                with_tz: !without_tz,
+            }),
             Self::Controller {
                 name,
                 actions,

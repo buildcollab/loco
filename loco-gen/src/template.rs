@@ -17,6 +17,8 @@ pub fn get_ignored_paths() -> Vec<&'static Path> {
         Path::new("migration"),
         #[cfg(not(feature = "with-db"))]
         Path::new("model"),
+        #[cfg(not(feature = "with-db"))]
+        Path::new("agent"),
     ]
 }
 
@@ -158,6 +160,7 @@ pub mod tests {
             assert!(ignored_paths.contains(&Path::new("scaffold")));
             assert!(ignored_paths.contains(&Path::new("migration")));
             assert!(ignored_paths.contains(&Path::new("model")));
+            assert!(ignored_paths.contains(&Path::new("agent")));
         }
         #[cfg(feature = "with-db")]
         {
