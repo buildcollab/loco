@@ -7,8 +7,14 @@
 //!
 //! The loop is deliberately free of any application concepts (no citation
 //! parsing, personas, scopes, or concrete tables). Everything app-specific
-//! arrives through the two traits below; the app does its own post-processing
+//! arrives through the traits below; the app does its own post-processing
 //! inside its [`ConversationStore::finalize_assistant_message`] implementation.
+//!
+//! Before each tool call runs, the loop consults an app-supplied
+//! [`ToolAuthorizer`], which may [`Allow`](ToolDecision::Allow),
+//! [`Deny`](ToolDecision::Deny) (a model-visible refusal), or
+//! [`RequireApproval`](ToolDecision::RequireApproval) (force the human-approval
+//! interrupt). Pass [`AllowAll`] to keep the built-in write-approval behavior.
 //!
 //! ## Emitted event sequence
 //!
@@ -71,6 +77,55 @@ pub trait ToolExecutor: Send + Sync {
     /// Tool failures surface as `Err`; the run-loop records them as an `error`
     /// tool result and continues.
     async fn execute(&self, name: &str, args: Value) -> Result<Value>;
+}
+
+/// The outcome of an authorization check for a single tool call.
+///
+/// Returned by [`ToolAuthorizer::authorize`], consulted by the run-loop *before*
+/// every tool call — ahead of the built-in [`ToolKind::Write`] +
+/// [`RunParams::auto_approve`] approval gate.
+#[derive(Debug, Clone)]
+pub enum ToolDecision {
+    /// Proceed. The call is still subject to the normal write/auto-approve
+    /// approval gate afterwards.
+    Allow,
+    /// Refuse without executing. `reason` is surfaced to the model as the tool
+    /// result (`{"denied": true, "reason": ...}`) so it can react and continue.
+    Deny { reason: String },
+    /// Route into the human-approval interrupt path regardless of the tool's
+    /// [`ToolKind`]. `reason` is echoed as the interrupt reason.
+    RequireApproval { reason: String },
+}
+
+/// App-supplied per-call authorization for tool calls.
+///
+/// The run-loop calls [`authorize`](ToolAuthorizer::authorize) for every tool
+/// the model requests before it runs. This is the seam for principal/scope
+/// checks: the implementor captures whatever request-scoped context it needs
+/// (authenticated user, scopes, tenant) at construction — the same injection
+/// pattern used by the app's [`ConversationStore`] — since the generic run-loop
+/// has no notion of a user.
+///
+/// Pass [`AllowAll`] to opt out (reproduces the pre-authorization behavior).
+#[async_trait::async_trait]
+pub trait ToolAuthorizer: Send + Sync {
+    /// Decide whether `call` (of the given `kind`) may run.
+    ///
+    /// # Errors
+    /// An `Err` aborts the run (surfaced as `RUN_ERROR`); use [`ToolDecision::Deny`]
+    /// for an ordinary, model-visible refusal.
+    async fn authorize(&self, call: &ToolCallReq, kind: ToolKind) -> Result<ToolDecision>;
+}
+
+/// A [`ToolAuthorizer`] that permits every call, preserving the behavior from
+/// before authorization existed (the built-in write/approval gate still applies).
+pub struct AllowAll;
+
+#[async_trait::async_trait]
+impl ToolAuthorizer for AllowAll {
+    async fn authorize(&self, _call: &ToolCallReq, _kind: ToolKind) -> Result<ToolDecision> {
+        Ok(ToolDecision::Allow)
+    }
 }
 
 /// App-supplied persistence for a single conversation. All ids returned here
@@ -146,18 +201,20 @@ enum LoopResult {
 /// # Errors
 /// Propagates provider/store/sink errors. On error, best-effort emits
 /// `RUN_ERROR`, sets status `errored`, and finalizes the message as `errored`.
-pub async fn run_turn<S, E, P, K>(
+pub async fn run_turn<S, E, P, K, A>(
     store: &S,
     exec: &E,
     provider: &P,
     sink: &K,
     params: &RunParams,
+    authz: &A,
 ) -> Result<()>
 where
     S: ConversationStore,
     E: ToolExecutor,
     P: Provider,
     K: EventSink,
+    A: ToolAuthorizer,
 {
     sink.emit(AguiEvent::RunStarted {
         thread_id: params.thread_id.clone(),
@@ -185,6 +242,7 @@ where
         provider,
         sink,
         params,
+        authz,
         &msg,
         &mut history,
         &mut parts,
@@ -201,12 +259,13 @@ where
 /// # Errors
 /// Errors if no `pending` tool call matches `item.interrupt_id`, or on
 /// provider/store/sink failure (same error handling as [`run_turn`]).
-pub async fn resume<S, E, P, K>(
+pub async fn resume<S, E, P, K, A>(
     store: &S,
     exec: &E,
     provider: &P,
     sink: &K,
     params: &RunParams,
+    authz: &A,
     item: &ResumeItem,
 ) -> Result<()>
 where
@@ -214,6 +273,7 @@ where
     E: ToolExecutor,
     P: Provider,
     K: EventSink,
+    A: ToolAuthorizer,
 {
     let pending = store
         .find_pending_tool_call(&item.interrupt_id)
@@ -251,8 +311,26 @@ where
 
     let result: Result<LoopResult> = async {
         if item.payload.approved {
+            // Defense in depth: re-authorize the approved call. The principal or
+            // scope may have changed between the interrupt and the approval, so a
+            // human "yes" does not override a `Deny`.
+            let kind = specs
+                .iter()
+                .find(|s| s.name == call.name)
+                .map_or(ToolKind::Write, |s| s.kind);
+            let (status, result) = match authz.authorize(&call, kind).await? {
+                ToolDecision::Deny { reason } => {
+                    let denied = json!({ "denied": true, "reason": reason });
+                    store.complete_tool_call(&tref, "denied", &denied, 0).await?;
+                    ("denied", denied)
+                }
+                // An approved call is already past its approval gate, so treat a
+                // repeated `RequireApproval` as an allow rather than looping.
+                ToolDecision::Allow | ToolDecision::RequireApproval { .. } => {
+                    execute_and_record(exec, store, &tref, &call).await?
+                }
+            };
             parts.push(part_tool_use(&call.id, &call.name, &call.arguments));
-            let (status, result) = execute_and_record(exec, store, &tref, &call).await?;
             sink.emit(AguiEvent::ToolCallResult {
                 message_id: msg.id.clone(),
                 tool_call_id: call.id.clone(),
@@ -277,6 +355,7 @@ where
                 provider,
                 sink,
                 params,
+                authz,
                 &msg,
                 &mut history,
                 &mut parts,
@@ -371,12 +450,13 @@ where
 /// `max_tool_turns`. Does not emit `TEXT_MESSAGE_END` or finalize — the caller
 /// ([`finalize_run`]) does, so `run_turn` and `resume` share that logic.
 #[allow(clippy::too_many_arguments)]
-async fn run_loop<S, E, P, K>(
+async fn run_loop<S, E, P, K, A>(
     store: &S,
     exec: &E,
     provider: &P,
     sink: &K,
     params: &RunParams,
+    authz: &A,
     msg: &MessageRef,
     history: &mut Vec<ChatMessage>,
     parts: &mut Vec<Value>,
@@ -388,6 +468,7 @@ where
     E: ToolExecutor,
     P: Provider,
     K: EventSink,
+    A: ToolAuthorizer,
 {
     for _turn in 0..params.max_tool_turns.max(1) {
         let outcome = stream_one_turn(provider, sink, &params.system, &msg.id, history, specs).await?;
@@ -424,7 +505,40 @@ where
                         .find(|s| s.name == call.name)
                         .map_or(ToolKind::Read, |s| s.kind);
 
-                    if kind == ToolKind::Write && !params.auto_approve {
+                    // Authorization gate — consulted before the built-in
+                    // write/auto-approve gate. Decides deny / require-approval /
+                    // allow for this specific call and principal.
+                    let interrupt_reason = match authz.authorize(call, kind).await? {
+                        ToolDecision::Deny { reason } => {
+                            // Hard refusal: never execute. Record + surface a
+                            // `denied` result the model can see, then move on.
+                            let denied = json!({ "denied": true, "reason": reason });
+                            let tref = store.record_tool_call(msg, call, "denied").await?;
+                            store.complete_tool_call(&tref, "denied", &denied, 0).await?;
+                            sink.emit(AguiEvent::ToolCallResult {
+                                message_id: msg.id.clone(),
+                                tool_call_id: call.id.clone(),
+                                content: denied.clone(),
+                            })
+                            .await?;
+                            parts.push(part_tool_use(&call.id, &call.name, &call.arguments));
+                            parts.push(part_tool_result(&call.id, "denied", &denied));
+                            history.push(ChatMessage::tool_result(&call.id, &denied.to_string()));
+                            continue;
+                        }
+                        // Force the human-approval path regardless of ToolKind.
+                        ToolDecision::RequireApproval { reason } => Some(reason),
+                        // Allowed: fall back to the built-in write/approval gate.
+                        ToolDecision::Allow => {
+                            if kind == ToolKind::Write && !params.auto_approve {
+                                Some("human_approval".to_string())
+                            } else {
+                                None
+                            }
+                        }
+                    };
+
+                    if let Some(reason) = interrupt_reason {
                         // Human-approval gate: record pending, interrupt, and
                         // finalize the message as still-streaming.
                         store.record_tool_call(msg, call, "pending").await?;
@@ -435,7 +549,7 @@ where
                             outcome: RunOutcome::Interrupt,
                             interrupt: Some(Interrupt {
                                 id: call.id.clone(),
-                                reason: "human_approval".to_string(),
+                                reason,
                                 payload: json!({
                                     "toolCallId": call.id,
                                     "name": call.name,
@@ -753,6 +867,28 @@ mod tests {
         }
     }
 
+    /// Denies every call with a fixed reason.
+    struct DenyAll;
+    #[async_trait::async_trait]
+    impl ToolAuthorizer for DenyAll {
+        async fn authorize(&self, _call: &ToolCallReq, _kind: ToolKind) -> Result<ToolDecision> {
+            Ok(ToolDecision::Deny {
+                reason: "not permitted".to_string(),
+            })
+        }
+    }
+
+    /// Forces the approval path for every call, regardless of ToolKind.
+    struct RequireApprovalAll;
+    #[async_trait::async_trait]
+    impl ToolAuthorizer for RequireApprovalAll {
+        async fn authorize(&self, _call: &ToolCallReq, _kind: ToolKind) -> Result<ToolDecision> {
+            Ok(ToolDecision::RequireApproval {
+                reason: "needs_review".to_string(),
+            })
+        }
+    }
+
     fn params(auto_approve: bool) -> RunParams {
         RunParams {
             system: "you are a test agent".to_string(),
@@ -771,7 +907,7 @@ mod tests {
         let sink = VecSink::default();
         let provider = StubProvider::with_reply("hi there friend");
 
-        run_turn(&store, &FakeExec, &provider, &sink, &params(false))
+        run_turn(&store, &FakeExec, &provider, &sink, &params(false), &AllowAll)
             .await
             .unwrap();
 
@@ -791,7 +927,7 @@ mod tests {
         let sink = VecSink::default();
         let provider = StubProvider::new();
 
-        run_turn(&store, &FakeExec, &provider, &sink, &params(true))
+        run_turn(&store, &FakeExec, &provider, &sink, &params(true), &AllowAll)
             .await
             .unwrap();
 
@@ -818,7 +954,7 @@ mod tests {
         let sink = VecSink::default();
         let provider = StubProvider::new();
 
-        run_turn(&store, &FakeExec, &provider, &sink, &params(false))
+        run_turn(&store, &FakeExec, &provider, &sink, &params(false), &AllowAll)
             .await
             .unwrap();
 
@@ -845,7 +981,7 @@ mod tests {
         let sink = VecSink::default();
         let provider = StubProvider::new();
 
-        run_turn(&store, &FakeExec, &provider, &sink, &params(false))
+        run_turn(&store, &FakeExec, &provider, &sink, &params(false), &AllowAll)
             .await
             .unwrap();
         assert_eq!(store.status(), "responding");
@@ -855,7 +991,7 @@ mod tests {
             interrupt_id: "call_stub_save_note".to_string(),
             payload: ResumePayload { approved: true },
         };
-        resume(&store, &FakeExec, &provider, &resume_sink, &params(false), &item)
+        resume(&store, &FakeExec, &provider, &resume_sink, &params(false), &AllowAll, &item)
             .await
             .unwrap();
 
@@ -881,7 +1017,7 @@ mod tests {
         let sink = VecSink::default();
         let provider = StubProvider::new();
 
-        run_turn(&store, &FakeExec, &provider, &sink, &params(false))
+        run_turn(&store, &FakeExec, &provider, &sink, &params(false), &AllowAll)
             .await
             .unwrap();
 
@@ -890,7 +1026,7 @@ mod tests {
             interrupt_id: "call_stub_save_note".to_string(),
             payload: ResumePayload { approved: false },
         };
-        resume(&store, &FakeExec, &provider, &resume_sink, &params(false), &item)
+        resume(&store, &FakeExec, &provider, &resume_sink, &params(false), &AllowAll, &item)
             .await
             .unwrap();
 
@@ -901,6 +1037,80 @@ mod tests {
         assert_eq!(
             store.tool_status("call_stub_save_note").as_deref(),
             Some("denied")
+        );
+    }
+
+    #[tokio::test]
+    async fn authz_deny_refuses_without_executing() {
+        let store = FakeStore::with_user("please write a note");
+        let sink = VecSink::default();
+        let provider = StubProvider::new();
+
+        // auto_approve = true so the *only* thing that can stop execution is the
+        // authorizer, not the built-in write gate.
+        run_turn(&store, &FakeExec, &provider, &sink, &params(true), &DenyAll)
+            .await
+            .unwrap();
+
+        let names = sink.names();
+        // Never executed: no TOOL_CALL_START/ARGS/END were emitted.
+        assert!(!names.contains(&"TOOL_CALL_START".to_string()));
+        // But the refusal is surfaced to the model as a tool result.
+        assert!(names.contains(&"TOOL_CALL_RESULT".to_string()));
+        // The run still completes successfully (deny is not an interrupt).
+        match sink.events().last().unwrap() {
+            AguiEvent::RunFinished { outcome, .. } => {
+                assert!(matches!(outcome, RunOutcome::Success));
+            }
+            _ => panic!("expected RunFinished"),
+        }
+        assert_eq!(store.status(), "idle");
+        assert_eq!(
+            store.tool_status("call_stub_save_note").as_deref(),
+            Some("denied")
+        );
+        // The emitted result carries the denial marker + reason.
+        let denied_content = sink.events().into_iter().find_map(|e| match e {
+            AguiEvent::ToolCallResult { content, .. } => Some(content),
+            _ => None,
+        });
+        let content = denied_content.expect("a TOOL_CALL_RESULT");
+        assert_eq!(content["denied"], json!(true));
+        assert_eq!(content["reason"], json!("not permitted"));
+    }
+
+    #[tokio::test]
+    async fn authz_require_approval_overrides_auto_approve() {
+        let store = FakeStore::with_user("please write a note");
+        let sink = VecSink::default();
+        let provider = StubProvider::new();
+
+        // With auto_approve = true the built-in gate would execute the write tool
+        // outright; RequireApproval must still force the interrupt.
+        run_turn(
+            &store,
+            &FakeExec,
+            &provider,
+            &sink,
+            &params(true),
+            &RequireApprovalAll,
+        )
+        .await
+        .unwrap();
+
+        match sink.events().last().unwrap() {
+            AguiEvent::RunFinished {
+                outcome, interrupt, ..
+            } => {
+                assert!(matches!(outcome, RunOutcome::Interrupt));
+                assert_eq!(interrupt.as_ref().unwrap().reason, "needs_review");
+            }
+            _ => panic!("expected interrupt RunFinished"),
+        }
+        assert_eq!(store.status(), "responding");
+        assert_eq!(
+            store.tool_status("call_stub_save_note").as_deref(),
+            Some("pending")
         );
     }
 }

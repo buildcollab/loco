@@ -398,6 +398,10 @@ fn parse_usage(v: &Value) -> Usage {
 /// direct `reqwest` client against `{base_url}/chat/completions` — streaming
 /// via SSE with `stream_options.include_usage`. This gives full control over
 /// streaming tool-call and usage handling.
+///
+/// Note: the `rig` (`rig-core`) crate is **not** used or depended upon anywhere
+/// in this project; the `Rig` in the name is purely historical. This is a
+/// self-contained `reqwest`-based client with no external agent framework.
 pub struct RigProvider {
     api_key: String,
     base_url: String,

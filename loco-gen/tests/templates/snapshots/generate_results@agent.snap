@@ -13,9 +13,12 @@ Next steps:
        export OPENROUTER_API_KEY=sk-or-...
   4. Seed an `agents` row (name, provider, model, system_prompt) and POST to
        /api/conversations/{conversation_pid}/run
-     with an AG-UI `RunAgentInput` body to stream a response.
+     with an AG-UI `RunAgentInput` body to stream a response. The `run`
+     endpoint requires a JWT; write tools additionally require a `memo:write`
+     entry in the token's `scopes` claim (see `AppAuthorizer`).
 
 This file is a starting point — customize the tools in `AgentTools`, the
-system-prompt assembly, and the message-history mapping to fit your app.
+authorization policy in `AppAuthorizer`, the system-prompt assembly, and the
+message-history mapping to fit your app.
 
 * Agent migration added! Apply it with `$ cargo loco db migrate && cargo loco db entities`.

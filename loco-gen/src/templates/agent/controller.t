@@ -12,10 +12,13 @@ message: |
          export OPENROUTER_API_KEY=sk-or-...
     4. Seed an `agents` row (name, provider, model, system_prompt) and POST to
          /api/conversations/{conversation_pid}/run
-       with an AG-UI `RunAgentInput` body to stream a response.
+       with an AG-UI `RunAgentInput` body to stream a response. The `run`
+       endpoint requires a JWT; write tools additionally require a `memo:write`
+       entry in the token's `scopes` claim (see `AppAuthorizer`).
 
   This file is a starting point — customize the tools in `AgentTools`, the
-  system-prompt assembly, and the message-history mapping to fit your app.
+  authorization policy in `AppAuthorizer`, the system-prompt assembly, and the
+  message-history mapping to fit your app.
 injections:
 - into: src/controllers/mod.rs
   append: true
@@ -31,13 +34,14 @@ injections:
 //! Exposes endpoints to list agents, open conversations, post context, and
 //! stream agent responses over the AG-UI protocol (SSE). The heavy lifting
 //! lives in `loco_rs::agui`; this file wires your database tables to its
-//! `ConversationStore` + `ToolExecutor` traits.
+//! `ConversationStore` + `ToolExecutor` traits and its `ToolAuthorizer`
+//! per-tool-call authorization seam.
 
 use async_trait::async_trait;
 use loco_rs::agui::{
     run_turn, resume, spawn_and_stream, ChatMessage, ConversationStore, MessageRef,
-    PendingToolCall, RigProvider, RunAgentInput, RunParams, ToolCallReq, ToolExecutor, ToolKind,
-    ToolRef, ToolSpec, Usage,
+    PendingToolCall, RigProvider, RunAgentInput, RunParams, ToolAuthorizer, ToolCallReq,
+    ToolDecision, ToolExecutor, ToolKind, ToolRef, ToolSpec, Usage,
 };
 use loco_rs::prelude::*;
 use serde::Deserialize;
@@ -85,6 +89,54 @@ impl ToolExecutor for AgentTools {
                 "text": args.get("text").and_then(Value::as_str).unwrap_or_default(),
             })),
             other => Err(Error::Message(format!("unknown tool: {other}"))),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tool authorization — checked for every tool call before it runs. Replace the
+// example policy with your own.
+// ---------------------------------------------------------------------------
+
+/// Scope a caller must hold to invoke a write tool in this example policy.
+const WRITE_SCOPE: &str = "memo:write";
+
+/// Per-call authorization for tool calls. Carries the authenticated principal's
+/// scopes (populated from `auth::JWT` claims in the `run` handler below); tune
+/// the policy in [`AppAuthorizer::authorize`] to fit your app.
+struct AppAuthorizer {
+    /// Scopes the caller holds, read from the JWT `scopes` claim.
+    scopes: Vec<String>,
+}
+
+impl AppAuthorizer {
+    fn has_scope(&self, scope: &str) -> bool {
+        self.scopes.iter().any(|s| s == scope)
+    }
+}
+
+#[async_trait]
+impl ToolAuthorizer for AppAuthorizer {
+    async fn authorize(&self, call: &ToolCallReq, kind: ToolKind) -> Result<ToolDecision> {
+        // Read tools are unrestricted in this example.
+        if kind == ToolKind::Read {
+            return Ok(ToolDecision::Allow);
+        }
+
+        // Write tools require an explicit scope. Callers without it are refused
+        // outright — the model sees the denial as the tool result and can
+        // respond. Callers with it fall through to the built-in human-approval
+        // gate (or run immediately when `RunParams::auto_approve` is set).
+        //
+        // The three decisions available here are `ToolDecision::Deny`,
+        // `ToolDecision::RequireApproval` (force approval even for a read tool),
+        // and `ToolDecision::Allow`.
+        if self.has_scope(WRITE_SCOPE) {
+            Ok(ToolDecision::Allow)
+        } else {
+            Ok(ToolDecision::Deny {
+                reason: format!("missing scope '{WRITE_SCOPE}' for tool '{}'", call.name),
+            })
         }
     }
 }
@@ -413,8 +465,23 @@ pub async fn add_context(
 pub async fn run(
     Path(conversation_pid): Path<String>,
     State(ctx): State<AppContext>,
+    auth: auth::JWT,
     Json(input): Json<RunAgentInput>,
 ) -> Result<Response> {
+    // Scopes the caller holds, read from the JWT `scopes` claim (a JSON array of
+    // strings). These drive `AppAuthorizer`'s per-tool-call decisions.
+    let scopes: Vec<String> = auth
+        .claims
+        .claims
+        .get("scopes")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
     let conversation = find_conversation(&ctx, &conversation_pid).await?;
     let agent = agents::Entity::find_by_id(conversation.agent_id)
         .one(&ctx.db)
@@ -452,10 +519,12 @@ pub async fn run(
 
     let sse = spawn_and_stream(64, || {}, move |sink| async move {
         let exec = AgentTools;
+        // Authorize every tool call against the caller's scopes.
+        let authz = AppAuthorizer { scopes };
         let result = if let Some(item) = resume_item {
-            resume(&store, &exec, &provider, &sink, &params, &item).await
+            resume(&store, &exec, &provider, &sink, &params, &authz, &item).await
         } else {
-            run_turn(&store, &exec, &provider, &sink, &params).await
+            run_turn(&store, &exec, &provider, &sink, &params, &authz).await
         };
         if let Err(err) = result {
             tracing::error!(error = %err, "agent run failed");
