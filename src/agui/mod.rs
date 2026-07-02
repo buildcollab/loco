@@ -5,7 +5,8 @@
 //! module is **generic infrastructure with zero business logic** — no app
 //! concepts (agents lists, modes, DB tables, personas) live here. Everything
 //! app-specific arrives through the [`runtime::ConversationStore`],
-//! [`runtime::ToolExecutor`], and [`provider::Provider`] traits.
+//! [`runtime::ToolExecutor`], [`runtime::ToolAuthorizer`], and
+//! [`provider::Provider`] traits.
 //!
 //! Enable with the `agui` cargo feature.
 //!
@@ -18,7 +19,8 @@
 //! - [`transport`] — an [`transport::EventSink`] plus the SSE response builder
 //!   and a `spawn_and_stream` convenience.
 //! - [`runtime`] — the reusable [`runtime::run_turn`] / [`runtime::resume`]
-//!   run-loop.
+//!   run-loop, plus the [`runtime::ToolAuthorizer`] per-call authorization seam
+//!   ([`runtime::AllowAll`] opts out).
 //!
 //! ## Sketch (an axum handler)
 //!
@@ -26,7 +28,7 @@
 //! use loco_rs::agui::{
 //!     protocol::RunAgentInput,
 //!     provider::RigProvider,
-//!     runtime::{run_turn, resume, RunParams},
+//!     runtime::{run_turn, resume, AllowAll, RunParams},
 //!     transport::spawn_and_stream,
 //! };
 //!
@@ -36,10 +38,13 @@
 //!     spawn_and_stream(64, move || { /* clear "responding" status */ }, move |sink| async move {
 //!         let store = /* impl ConversationStore for this conversation */;
 //!         let exec  = /* impl ToolExecutor */;
+//!         // Per-call authorization; swap `AllowAll` for an app `impl ToolAuthorizer`
+//!         // that checks the authenticated principal/scopes.
+//!         let authz = AllowAll;
 //!         let res = if let Some(item) = input.resume.first() {
-//!             resume(&store, &exec, &provider, &sink, &params, item).await
+//!             resume(&store, &exec, &provider, &sink, &params, &authz, item).await
 //!         } else {
-//!             run_turn(&store, &exec, &provider, &sink, &params).await
+//!             run_turn(&store, &exec, &provider, &sink, &params, &authz).await
 //!         };
 //!         let _ = res; // errors are already surfaced as RUN_ERROR on the sink
 //!     })
@@ -61,7 +66,7 @@ pub use provider::{
     ToolKind, ToolSpec, TurnOutcome, Usage, OPENROUTER_BASE_URL,
 };
 pub use runtime::{
-    resume, run_turn, ConversationStore, MessageRef, PendingToolCall, RunParams, ToolExecutor,
-    ToolRef,
+    resume, run_turn, AllowAll, ConversationStore, MessageRef, PendingToolCall, RunParams,
+    ToolAuthorizer, ToolDecision, ToolExecutor, ToolRef,
 };
 pub use transport::{event_to_sse, sse_response, spawn_and_stream, EventSink, MpscSink, NullSink};
