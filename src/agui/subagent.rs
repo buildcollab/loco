@@ -41,10 +41,11 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
+use crate::agui::protocol::{Interrupt, ResumeItem, ResumePayload};
 use crate::agui::provider::{ChatMessage, Provider, ToolCallReq, ToolKind, ToolSpec, Usage};
 use crate::agui::runtime::{
-    run_turn, AllowAll, ConversationStore, MessageRef, PendingToolCall, RunParams, ToolAuthorizer,
-    ToolExecutor, ToolRef,
+    resume, run_turn, AllowAll, ConversationStore, MessageRef, PendingToolCall, RunParams,
+    ToolAuthorizer, ToolExecutor, ToolRef,
 };
 use crate::agui::transport::{EventSink, NullSink};
 use crate::{Error, Result};
@@ -76,6 +77,21 @@ pub struct SubagentCtx {
     pub max_depth: usize,
 }
 
+/// The result of a single (possibly interrupting) subagent step.
+///
+/// A subagent that hits a human-approval gate returns [`Interrupted`], carrying
+/// the [`Interrupt`] to bubble up to the parent and an opaque, serializable
+/// `state` blob the parent persists and later hands back to
+/// [`Subagent::resume_step`].
+///
+/// [`Interrupted`]: SubagentStep::Interrupted
+pub enum SubagentStep {
+    /// The subagent finished and produced its answer.
+    Done(SubagentOutput),
+    /// The subagent paused for human approval; `state` resumes it.
+    Interrupted { interrupt: Interrupt, state: Value },
+}
+
 /// A child agent the parent can delegate to. Object-safe so a registry can hold
 /// heterogeneous `Arc<dyn Subagent>`.
 #[async_trait]
@@ -96,6 +112,38 @@ pub trait Subagent: Send + Sync {
     /// parent as an `error` tool result.
     async fn run(&self, input: &str, ctx: &SubagentCtx, sink: &dyn EventSink)
         -> Result<SubagentOutput>;
+
+    /// Start the subagent, allowing it to pause for human approval. The default
+    /// runs to completion via [`run`](Subagent::run) and never interrupts —
+    /// override to support approval bubble-up.
+    ///
+    /// # Errors
+    /// As [`run`](Subagent::run).
+    async fn start(
+        &self,
+        input: &str,
+        ctx: &SubagentCtx,
+        sink: &dyn EventSink,
+    ) -> Result<SubagentStep> {
+        Ok(SubagentStep::Done(self.run(input, ctx, sink).await?))
+    }
+
+    /// Resume a subagent previously suspended by [`start`](Subagent::start),
+    /// answering its approval gate. The default rejects resumption (a subagent
+    /// that never interrupts is never resumed).
+    ///
+    /// # Errors
+    /// If the subagent does not support resumption, or on provider/store failure.
+    async fn resume_step(
+        &self,
+        state: Value,
+        approved: bool,
+        ctx: &SubagentCtx,
+        sink: &dyn EventSink,
+    ) -> Result<SubagentStep> {
+        let _ = (state, approved, ctx, sink);
+        Err(Error::string("this subagent does not support resume"))
+    }
 }
 
 /// A concrete subagent backed by a [`Provider`] + a **local** [`ToolExecutor`].
@@ -112,6 +160,43 @@ pub struct LocalSubagent<P, E, A = AllowAll> {
     pub exec: E,
     pub authz: A,
     pub max_tool_turns: usize,
+}
+
+impl<P, E, A> LocalSubagent<P, E, A> {
+    fn params(&self, ctx: &SubagentCtx, auto_approve: bool) -> RunParams {
+        RunParams {
+            system: self.system.clone(),
+            run_id: format!("sub-{}-{}", self.name, ctx.depth),
+            thread_id: format!("sub-{}", self.name),
+            auto_approve,
+            max_tool_turns: self.max_tool_turns,
+        }
+    }
+
+    /// Map the store state after a (possibly interrupted) run to a step.
+    fn step_from_store(&self, store: &InMemoryStore) -> SubagentStep {
+        if let Some(p) = store.pending() {
+            let interrupt = Interrupt {
+                id: p.tool_call_id.clone(),
+                reason: "subagent_approval".to_string(),
+                payload: json!({
+                    "subagent": self.name,
+                    "toolCallId": p.tool_call_id,
+                    "name": p.name,
+                    "arguments": p.arguments,
+                }),
+            };
+            SubagentStep::Interrupted {
+                interrupt,
+                state: store.to_state(),
+            }
+        } else {
+            SubagentStep::Done(SubagentOutput {
+                text: store.final_text(),
+                usage: store.final_usage(),
+            })
+        }
+    }
 }
 
 #[async_trait]
@@ -134,28 +219,71 @@ where
         sink: &dyn EventSink,
     ) -> Result<SubagentOutput> {
         let store = InMemoryStore::with_user(input);
-        let params = RunParams {
-            system: self.system.clone(),
-            run_id: format!("sub-{}-{}", self.name, ctx.depth),
-            thread_id: format!("sub-{}", self.name),
-            // The subagent owns its own write decision via `authz`; delegation
-            // is not gated by the parent's human-approval interrupt in this
-            // (non-interrupting) path.
-            auto_approve: true,
-            max_tool_turns: self.max_tool_turns,
-        };
+        // `run` auto-approves the subagent's own write tools (never interrupts);
+        // use `start`/`resume_step` for the human-approval bubble-up path.
+        let params = self.params(ctx, true);
         run_turn(&store, &self.exec, &self.provider, &sink, &params, &self.authz).await?;
         Ok(SubagentOutput {
             text: store.final_text(),
             usage: store.final_usage(),
         })
     }
+
+    async fn start(
+        &self,
+        input: &str,
+        ctx: &SubagentCtx,
+        sink: &dyn EventSink,
+    ) -> Result<SubagentStep> {
+        let store = InMemoryStore::with_user(input);
+        // auto_approve = false so the subagent's write tools raise an approval
+        // interrupt that bubbles up to the parent.
+        let params = self.params(ctx, false);
+        run_turn(&store, &self.exec, &self.provider, &sink, &params, &self.authz).await?;
+        Ok(self.step_from_store(&store))
+    }
+
+    async fn resume_step(
+        &self,
+        state: Value,
+        approved: bool,
+        ctx: &SubagentCtx,
+        sink: &dyn EventSink,
+    ) -> Result<SubagentStep> {
+        let store = InMemoryStore::from_state(state);
+        let pending = store
+            .pending()
+            .ok_or_else(|| Error::string("no pending subagent tool call to resume"))?;
+        let params = self.params(ctx, false);
+        let item = ResumeItem {
+            interrupt_id: pending.tool_call_id.clone(),
+            payload: ResumePayload { approved },
+        };
+        resume(&store, &self.exec, &self.provider, &sink, &params, &self.authz, &item).await?;
+        Ok(self.step_from_store(&store))
+    }
 }
 
 /// A set of subagents, each exposed to a parent as one tool.
-#[derive(Default, Clone)]
+///
+/// Also carries the child [`EventSink`] (a DB-logging sink, say) and the
+/// recursion `max_depth` used by the approval bubble-up path
+/// ([`run_turn_with_subagents`](crate::agui::runtime::run_turn_with_subagents)).
+#[derive(Clone)]
 pub struct SubagentRegistry {
     agents: Vec<Arc<dyn Subagent>>,
+    child_sink: Arc<dyn EventSink>,
+    max_depth: usize,
+}
+
+impl Default for SubagentRegistry {
+    fn default() -> Self {
+        Self {
+            agents: Vec::new(),
+            child_sink: Arc::new(NullSink),
+            max_depth: DEFAULT_MAX_SUBAGENT_DEPTH,
+        }
+    }
 }
 
 impl SubagentRegistry {
@@ -169,6 +297,33 @@ impl SubagentRegistry {
     pub fn register_arc(&mut self, agent: Arc<dyn Subagent>) -> &mut Self {
         self.agents.push(agent);
         self
+    }
+
+    /// Set the child event sink used for subagent runs in the bubble-up path
+    /// (e.g. a sink that persists events to a table for review). Builder style.
+    #[must_use]
+    pub fn with_sink(mut self, sink: Arc<dyn EventSink>) -> Self {
+        self.child_sink = sink;
+        self
+    }
+
+    /// Set the maximum subagent nesting depth. Builder style.
+    #[must_use]
+    pub fn with_max_depth(mut self, max_depth: usize) -> Self {
+        self.max_depth = max_depth;
+        self
+    }
+
+    /// The configured child event sink.
+    #[must_use]
+    pub fn child_sink(&self) -> Arc<dyn EventSink> {
+        self.child_sink.clone()
+    }
+
+    /// The configured maximum nesting depth.
+    #[must_use]
+    pub fn max_depth(&self) -> usize {
+        self.max_depth
     }
 
     /// Look up a subagent by its tool name.
@@ -331,12 +486,27 @@ pub struct InMemoryStore {
     inner: Mutex<InMemState>,
 }
 
-#[derive(Default)]
+/// A tool-call record (mirrors the fields a persistent store keeps), so an
+/// interrupted subagent's `pending` call can be found on resume.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct ToolRecord {
+    tool_call_id: String,
+    name: String,
+    arguments: Value,
+    message_id: String,
+    status: String,
+}
+
+/// Serializable snapshot of an [`InMemoryStore`] — the suspended state a parent
+/// persists across an interrupt and hands back to resume the subagent.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 struct InMemState {
     history: Vec<ChatMessage>,
     seq: usize,
+    tools: Vec<ToolRecord>,
     final_parts: Value,
     final_usage: Usage,
+    status: String,
 }
 
 impl InMemoryStore {
@@ -380,6 +550,36 @@ impl InMemoryStore {
     pub fn final_usage(&self) -> Usage {
         self.inner.lock().unwrap().final_usage.clone()
     }
+
+    /// The first `pending` tool call, if the sub-run is suspended awaiting approval.
+    #[must_use]
+    pub fn pending(&self) -> Option<PendingToolCall> {
+        let s = self.inner.lock().unwrap();
+        s.tools
+            .iter()
+            .find(|t| t.status == "pending")
+            .map(|t| PendingToolCall {
+                tool_call_id: t.tool_call_id.clone(),
+                name: t.name.clone(),
+                arguments: t.arguments.clone(),
+                message_id: t.message_id.clone(),
+            })
+    }
+
+    /// Serialize the store into an opaque state blob (for cross-request resume).
+    #[must_use]
+    pub fn to_state(&self) -> Value {
+        serde_json::to_value(&*self.inner.lock().unwrap()).unwrap_or(Value::Null)
+    }
+
+    /// Reconstruct a store from a blob produced by [`to_state`](InMemoryStore::to_state).
+    #[must_use]
+    pub fn from_state(state: Value) -> Self {
+        let inner = serde_json::from_value::<InMemState>(state).unwrap_or_default();
+        Self {
+            inner: Mutex::new(inner),
+        }
+    }
 }
 
 #[async_trait]
@@ -407,20 +607,32 @@ impl ConversationStore for InMemoryStore {
 
     async fn record_tool_call(
         &self,
-        _msg: &MessageRef,
+        msg: &MessageRef,
         call: &ToolCallReq,
-        _status: &str,
+        status: &str,
     ) -> Result<ToolRef> {
+        let mut s = self.inner.lock().unwrap();
+        s.tools.push(ToolRecord {
+            tool_call_id: call.id.clone(),
+            name: call.name.clone(),
+            arguments: call.arguments.clone(),
+            message_id: msg.id.clone(),
+            status: status.to_string(),
+        });
         Ok(ToolRef { id: call.id.clone() })
     }
 
     async fn complete_tool_call(
         &self,
-        _tool: &ToolRef,
-        _status: &str,
+        tool: &ToolRef,
+        status: &str,
         _result: &Value,
         _duration_ms: i64,
     ) -> Result<()> {
+        let mut s = self.inner.lock().unwrap();
+        if let Some(t) = s.tools.iter_mut().find(|t| t.tool_call_id == tool.id) {
+            t.status = status.to_string();
+        }
         Ok(())
     }
 
@@ -437,12 +649,21 @@ impl ConversationStore for InMemoryStore {
         Ok(())
     }
 
-    async fn find_pending_tool_call(&self, _tool_call_id: &str) -> Result<Option<PendingToolCall>> {
-        // In-memory subagents auto-approve, so nothing is ever pending.
-        Ok(None)
+    async fn find_pending_tool_call(&self, tool_call_id: &str) -> Result<Option<PendingToolCall>> {
+        let s = self.inner.lock().unwrap();
+        Ok(s.tools
+            .iter()
+            .find(|t| t.tool_call_id == tool_call_id && t.status == "pending")
+            .map(|t| PendingToolCall {
+                tool_call_id: t.tool_call_id.clone(),
+                name: t.name.clone(),
+                arguments: t.arguments.clone(),
+                message_id: t.message_id.clone(),
+            }))
     }
 
-    async fn set_conversation_status(&self, _status: &str) -> Result<()> {
+    async fn set_conversation_status(&self, status: &str) -> Result<()> {
+        self.inner.lock().unwrap().status = status.to_string();
         Ok(())
     }
 }

@@ -41,7 +41,7 @@ pub enum AgentDelta {
 }
 
 /// Token accounting for a turn.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Usage {
     pub input_tokens: i64,
     pub output_tokens: i64,
@@ -75,7 +75,7 @@ pub struct ToolSpec {
 }
 
 /// A concrete tool invocation requested by the model.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ToolCallReq {
     pub id: String,
     pub name: String,
@@ -83,7 +83,7 @@ pub struct ToolCallReq {
 }
 
 /// A single message in the conversation history sent to the provider.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,

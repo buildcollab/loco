@@ -41,8 +41,13 @@ use crate::agui::protocol::{
 use crate::agui::provider::{
     ChatMessage, Provider, ToolCallReq, ToolKind, ToolSpec, TurnOutcome, Usage,
 };
+use crate::agui::subagent::{SubagentCtx, SubagentRegistry, SubagentStep};
 use crate::agui::transport::EventSink;
 use crate::{Error, Result};
+
+/// Key under which a bubbled-up subagent's suspended state is stashed in the
+/// parent pending delegation call's arguments (so `resume` can route back).
+const SUBAGENT_STATE_KEY: &str = "__subagent_state";
 
 /// Handle to a persisted message, identified by its public id (used verbatim in
 /// emitted events).
@@ -244,6 +249,57 @@ where
     K: EventSink,
     A: ToolAuthorizer,
 {
+    run_turn_impl(store, exec, provider, sink, params, authz, None).await
+}
+
+/// Like [`run_turn`], but delegation tool calls that match a subagent in
+/// `subagents` are run as nested agents; a subagent's human-approval need
+/// bubbles up as a parent interrupt (see [`crate::agui::subagent`]).
+///
+/// # Errors
+/// As [`run_turn`].
+#[instrument(
+    target = "loco_rs::agui",
+    name = "agui.run_turn_subagents",
+    skip_all,
+    fields(run_id = %params.run_id, thread_id = %params.thread_id, model = %provider.model_id()),
+)]
+pub async fn run_turn_with_subagents<S, E, P, K, A>(
+    store: &S,
+    exec: &E,
+    provider: &P,
+    sink: &K,
+    params: &RunParams,
+    authz: &A,
+    subagents: &SubagentRegistry,
+) -> Result<()>
+where
+    S: ConversationStore,
+    E: ToolExecutor,
+    P: Provider,
+    K: EventSink,
+    A: ToolAuthorizer,
+{
+    run_turn_impl(store, exec, provider, sink, params, authz, Some(subagents)).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_turn_impl<S, E, P, K, A>(
+    store: &S,
+    exec: &E,
+    provider: &P,
+    sink: &K,
+    params: &RunParams,
+    authz: &A,
+    subagents: Option<&SubagentRegistry>,
+) -> Result<()>
+where
+    S: ConversationStore,
+    E: ToolExecutor,
+    P: Provider,
+    K: EventSink,
+    A: ToolAuthorizer,
+{
     sink.emit(AguiEvent::RunStarted {
         thread_id: params.thread_id.clone(),
         run_id: params.run_id.clone(),
@@ -260,7 +316,7 @@ where
     .await?;
 
     let mut history = store.load_history().await?;
-    let specs = exec.specs();
+    let specs = merged_specs(exec, subagents);
     let mut parts: Vec<Value> = Vec::new();
     let mut total_usage = Usage::default();
 
@@ -271,6 +327,7 @@ where
         sink,
         params,
         authz,
+        subagents,
         &msg,
         &mut history,
         &mut parts,
@@ -280,6 +337,23 @@ where
     .await;
 
     finalize_run(store, sink, params, &msg, &parts, &total_usage, result).await
+}
+
+/// The tool specs the provider should see: the executor's tools plus one entry
+/// per subagent (so the model can call them). Subagent specs come from the
+/// registry; a name collision keeps the executor's spec (first-wins).
+fn merged_specs<E: ToolExecutor>(exec: &E, subagents: Option<&SubagentRegistry>) -> Vec<ToolSpec> {
+    let mut specs = exec.specs();
+    if let Some(reg) = subagents {
+        let have: std::collections::BTreeSet<String> =
+            specs.iter().map(|s| s.name.clone()).collect();
+        for s in reg.specs() {
+            if !have.contains(&s.name) {
+                specs.push(s);
+            }
+        }
+    }
+    specs
 }
 
 /// Resume a previously interrupted run by answering its approval gate.
@@ -300,6 +374,59 @@ pub async fn resume<S, E, P, K, A>(
     sink: &K,
     params: &RunParams,
     authz: &A,
+    item: &ResumeItem,
+) -> Result<()>
+where
+    S: ConversationStore,
+    E: ToolExecutor,
+    P: Provider,
+    K: EventSink,
+    A: ToolAuthorizer,
+{
+    resume_impl(store, exec, provider, sink, params, authz, None, item).await
+}
+
+/// Like [`resume`], but if the pending call is a subagent delegation the
+/// approval is routed back into the suspended subagent (approval bubble-up).
+///
+/// # Errors
+/// As [`resume`].
+#[instrument(
+    target = "loco_rs::agui",
+    name = "agui.resume_subagents",
+    skip_all,
+    fields(run_id = %params.run_id, thread_id = %params.thread_id, interrupt_id = %item.interrupt_id),
+)]
+#[allow(clippy::too_many_arguments)]
+pub async fn resume_with_subagents<S, E, P, K, A>(
+    store: &S,
+    exec: &E,
+    provider: &P,
+    sink: &K,
+    params: &RunParams,
+    authz: &A,
+    subagents: &SubagentRegistry,
+    item: &ResumeItem,
+) -> Result<()>
+where
+    S: ConversationStore,
+    E: ToolExecutor,
+    P: Provider,
+    K: EventSink,
+    A: ToolAuthorizer,
+{
+    resume_impl(store, exec, provider, sink, params, authz, Some(subagents), item).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resume_impl<S, E, P, K, A>(
+    store: &S,
+    exec: &E,
+    provider: &P,
+    sink: &K,
+    params: &RunParams,
+    authz: &A,
+    subagents: Option<&SubagentRegistry>,
     item: &ResumeItem,
 ) -> Result<()>
 where
@@ -330,7 +457,7 @@ where
     .await?;
 
     let mut history = store.load_history().await?;
-    let specs = exec.specs();
+    let specs = merged_specs(exec, subagents);
     let mut parts: Vec<Value> = Vec::new();
     let mut total_usage = Usage::default();
 
@@ -342,6 +469,77 @@ where
     let tref = ToolRef {
         id: pending.tool_call_id.clone(),
     };
+
+    // Subagent-delegation resume: route the approval back into the suspended
+    // child, then continue (or bubble again).
+    if let Some(agent) = pending
+        .arguments
+        .get(SUBAGENT_STATE_KEY)
+        .and(subagents)
+        .and_then(|r| r.get(&pending.name).cloned())
+    {
+        let reg = subagents.expect("registry present when subagent resolved");
+        let state = pending.arguments[SUBAGENT_STATE_KEY].clone();
+        let display_call = ToolCallReq {
+            id: pending.tool_call_id.clone(),
+            name: pending.name.clone(),
+            arguments: json!({ "input": pending.arguments.get("input").cloned().unwrap_or(Value::Null) }),
+        };
+        let ctx = SubagentCtx {
+            depth: 1,
+            max_depth: reg.max_depth(),
+        };
+        let child_sink = reg.child_sink();
+        let result: Result<LoopResult> = async {
+            match agent
+                .resume_step(state, item.payload.approved, &ctx, child_sink.as_ref())
+                .await
+            {
+                Ok(SubagentStep::Interrupted { interrupt, state }) => {
+                    bubble_subagent_interrupt(
+                        store, sink, params, &msg, &display_call, interrupt, state, &mut parts,
+                        &total_usage,
+                    )
+                    .await?;
+                    Ok(LoopResult::Interrupted)
+                }
+                other => {
+                    let (status, res) = match other {
+                        Ok(SubagentStep::Done(out)) => ("success", json!({ "output": out.text })),
+                        Err(e) => ("error", json!({ "error": e.to_string() })),
+                        Ok(SubagentStep::Interrupted { .. }) => unreachable!(),
+                    };
+                    store.complete_tool_call(&tref, status, &res, 0).await?;
+                    sink.emit(AguiEvent::ToolCallResult {
+                        message_id: msg.id.clone(),
+                        tool_call_id: display_call.id.clone(),
+                        content: res.clone(),
+                    })
+                    .await?;
+                    parts.push(part_tool_use(
+                        &display_call.id,
+                        &display_call.name,
+                        &display_call.arguments,
+                    ));
+                    parts.push(part_tool_result(&display_call.id, status, &res));
+                    history.push(ChatMessage {
+                        role: "assistant".to_string(),
+                        content: String::new(),
+                        tool_calls: vec![display_call.clone()],
+                        tool_call_id: None,
+                    });
+                    history.push(ChatMessage::tool_result(&display_call.id, &res.to_string()));
+                    run_loop(
+                        store, exec, provider, sink, params, authz, subagents, &msg, &mut history,
+                        &mut parts, &mut total_usage, &specs,
+                    )
+                    .await
+                }
+            }
+        }
+        .await;
+        return finalize_run(store, sink, params, &msg, &parts, &total_usage, result).await;
+    }
 
     let result: Result<LoopResult> = async {
         if item.payload.approved {
@@ -390,6 +588,7 @@ where
                 sink,
                 params,
                 authz,
+                subagents,
                 &msg,
                 &mut history,
                 &mut parts,
@@ -492,6 +691,7 @@ async fn run_loop<S, E, P, K, A>(
     sink: &K,
     params: &RunParams,
     authz: &A,
+    subagents: Option<&SubagentRegistry>,
     msg: &MessageRef,
     history: &mut Vec<ChatMessage>,
     parts: &mut Vec<Value>,
@@ -613,6 +813,50 @@ where
                         return Ok(LoopResult::Interrupted);
                     }
 
+                    // Subagent delegation: run the matching child as a nested
+                    // agent. A child's human-approval need bubbles up as a parent
+                    // interrupt whose pending call carries the child's suspended
+                    // state for `resume` to route back into (see `subagent`).
+                    if let Some(agent) = subagents.and_then(|r| r.get(&call.name).cloned()) {
+                        let reg = subagents.expect("registry present when agent resolved");
+                        emit_tool_call_frames(sink, &msg.id, call).await?;
+                        let input = call
+                            .arguments
+                            .get("input")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        let ctx = SubagentCtx {
+                            depth: 1,
+                            max_depth: reg.max_depth(),
+                        };
+                        let child_sink = reg.child_sink();
+                        match agent.start(input, &ctx, child_sink.as_ref()).await {
+                            Ok(SubagentStep::Done(out)) => {
+                                let result = json!({ "output": out.text });
+                                record_delegation_result(
+                                    store, sink, &msg.id, call, "success", &result, parts, history,
+                                )
+                                .await?;
+                            }
+                            Ok(SubagentStep::Interrupted { interrupt, state }) => {
+                                bubble_subagent_interrupt(
+                                    store, sink, params, msg, call, interrupt, state, parts,
+                                    total_usage,
+                                )
+                                .await?;
+                                return Ok(LoopResult::Interrupted);
+                            }
+                            Err(e) => {
+                                let result = json!({ "error": e.to_string() });
+                                record_delegation_result(
+                                    store, sink, &msg.id, call, "error", &result, parts, history,
+                                )
+                                .await?;
+                            }
+                        }
+                        continue;
+                    }
+
                     // Read tool, or write tool with auto-approve: execute now.
                     let tref = store.record_tool_call(msg, call, "pending").await?;
                     sink.emit(AguiEvent::ToolCallStart {
@@ -676,6 +920,111 @@ where
     Ok((status, result))
 }
 
+/// Emit the `TOOL_CALL_START/ARGS/END` frames for a tool (or subagent) call.
+async fn emit_tool_call_frames<K: EventSink>(
+    sink: &K,
+    msg_id: &str,
+    call: &ToolCallReq,
+) -> Result<()> {
+    sink.emit(AguiEvent::ToolCallStart {
+        tool_call_id: call.id.clone(),
+        tool_call_name: call.name.clone(),
+        parent_message_id: msg_id.to_string(),
+    })
+    .await?;
+    sink.emit(AguiEvent::ToolCallArgs {
+        tool_call_id: call.id.clone(),
+        delta: call.arguments.to_string(),
+    })
+    .await?;
+    sink.emit(AguiEvent::ToolCallEnd {
+        tool_call_id: call.id.clone(),
+    })
+    .await
+}
+
+/// Record + surface a completed subagent delegation's result (success or error)
+/// and thread it into `parts`/`history` so the parent model reacts to it.
+#[allow(clippy::too_many_arguments)]
+async fn record_delegation_result<S, K>(
+    store: &S,
+    sink: &K,
+    msg_id: &str,
+    call: &ToolCallReq,
+    status: &'static str,
+    result: &Value,
+    parts: &mut Vec<Value>,
+    history: &mut Vec<ChatMessage>,
+) -> Result<()>
+where
+    S: ConversationStore,
+    K: EventSink,
+{
+    let tref = store.record_tool_call(&MessageRef { id: msg_id.to_string() }, call, "pending").await?;
+    store.complete_tool_call(&tref, status, result, 0).await?;
+    sink.emit(AguiEvent::ToolCallResult {
+        message_id: msg_id.to_string(),
+        tool_call_id: call.id.clone(),
+        content: result.clone(),
+    })
+    .await?;
+    parts.push(part_tool_use(&call.id, &call.name, &call.arguments));
+    parts.push(part_tool_result(&call.id, status, result));
+    history.push(ChatMessage::tool_result(&call.id, &result.to_string()));
+    Ok(())
+}
+
+/// Bubble a subagent's approval interrupt up to the parent: persist a `pending`
+/// delegation call carrying the child's suspended `state`, emit the parent
+/// `RUN_FINISHED(Interrupt)` (keyed by the parent delegation id), and finalize
+/// the message as still-streaming.
+#[allow(clippy::too_many_arguments)]
+async fn bubble_subagent_interrupt<S, K>(
+    store: &S,
+    sink: &K,
+    params: &RunParams,
+    msg: &MessageRef,
+    call: &ToolCallReq,
+    interrupt: Interrupt,
+    state: Value,
+    parts: &mut Vec<Value>,
+    total_usage: &Usage,
+) -> Result<()>
+where
+    S: ConversationStore,
+    K: EventSink,
+{
+    // The pending call is keyed by the parent delegation id and carries the
+    // child's suspended state so `resume` can re-enter the subagent.
+    let pending_call = ToolCallReq {
+        id: call.id.clone(),
+        name: call.name.clone(),
+        arguments: json!({
+            "input": call.arguments.get("input").cloned().unwrap_or(Value::Null),
+            SUBAGENT_STATE_KEY: state,
+        }),
+    };
+    store.record_tool_call(msg, &pending_call, "pending").await?;
+    parts.push(part_tool_use(&call.id, &call.name, &call.arguments));
+    sink.emit(AguiEvent::RunFinished {
+        thread_id: params.thread_id.clone(),
+        run_id: params.run_id.clone(),
+        outcome: RunOutcome::Interrupt,
+        interrupt: Some(Interrupt {
+            id: call.id.clone(), // parent delegation id — the resume key
+            reason: interrupt.reason,
+            payload: interrupt.payload,
+        }),
+    })
+    .await?;
+    store
+        .finalize_assistant_message(msg, Value::Array(parts.clone()), total_usage, "streaming")
+        .await?;
+    store.set_conversation_status("responding").await?;
+    info!(target: "loco_rs::agui", subagent = %call.name, "subagent approval interrupt bubbled up");
+    Ok(())
+}
+
 /// Stream a single provider turn, forwarding text deltas to the sink as
 /// `TEXT_MESSAGE_CONTENT`, and return the assembled outcome.
 ///
@@ -729,7 +1078,8 @@ where
 mod tests {
     use super::*;
     use crate::agui::protocol::{ResumePayload, ResumeItem};
-    use crate::agui::provider::StubProvider;
+    use crate::agui::provider::{AgentDelta, StubProvider};
+    use crate::agui::subagent::LocalSubagent;
     use std::sync::{Arc, Mutex};
 
     // ----- fakes -------------------------------------------------------------
@@ -1159,5 +1509,182 @@ mod tests {
             store.tool_status("call_stub_save_note").as_deref(),
             Some("pending")
         );
+    }
+
+    // ----- Stage 3: subagent approval bubble-up -----------------------------
+
+    /// A parent provider that delegates to `tool` on the first (user) turn and
+    /// returns a final answer once a tool result is in history.
+    struct DelegatingProvider {
+        tool: String,
+    }
+    #[async_trait::async_trait]
+    impl Provider for DelegatingProvider {
+        fn model_id(&self) -> String {
+            "parent-model".to_string()
+        }
+        async fn run_turn(&self, _s: &str, _h: &[ChatMessage], _t: &[ToolSpec]) -> Result<TurnOutcome> {
+            unreachable!("streaming only in this test")
+        }
+        async fn stream_turn(
+            &self,
+            _system: &str,
+            history: &[ChatMessage],
+            _tools: &[ToolSpec],
+            tx: &tokio::sync::mpsc::Sender<AgentDelta>,
+        ) -> Result<TurnOutcome> {
+            let last_is_user = history.last().map(|m| m.role == "user").unwrap_or(false);
+            if last_is_user {
+                Ok(TurnOutcome::Tools {
+                    calls: vec![ToolCallReq {
+                        id: "del_1".to_string(),
+                        name: self.tool.clone(),
+                        arguments: json!({ "input": "please update the record" }),
+                    }],
+                    usage: Usage::default(),
+                    partial_text: String::new(),
+                })
+            } else {
+                let _ = tx.send(AgentDelta::TextDelta("all done".to_string())).await;
+                Ok(TurnOutcome::Final {
+                    text: "all done".to_string(),
+                    usage: Usage::default(),
+                })
+            }
+        }
+    }
+
+    // The subagent's own local write tool.
+    struct WriteExec;
+    #[async_trait::async_trait]
+    impl ToolExecutor for WriteExec {
+        fn specs(&self) -> Vec<ToolSpec> {
+            vec![ToolSpec {
+                name: "save".to_string(),
+                description: "save".to_string(),
+                parameters: json!({"type": "object"}),
+                kind: ToolKind::Write,
+            }]
+        }
+        async fn execute(&self, name: &str, _args: Value) -> Result<Value> {
+            Ok(json!({ "saved": name }))
+        }
+    }
+
+    fn worker_registry() -> SubagentRegistry {
+        let mut reg = SubagentRegistry::default();
+        reg.register(LocalSubagent {
+            name: "worker".to_string(),
+            description: "does work with a write tool".to_string(),
+            system: "you are a worker".to_string(),
+            provider: StubProvider::new(),
+            exec: WriteExec,
+            authz: AllowAll,
+            max_tool_turns: 4,
+        });
+        reg
+    }
+
+    #[tokio::test]
+    async fn subagent_write_bubbles_up_and_resumes_to_success() {
+        let store = FakeStore::with_user("delegate please");
+        let sink = VecSink::default();
+        let provider = DelegatingProvider { tool: "worker".to_string() };
+        let reg = worker_registry();
+
+        // 1) Parent delegates → subagent's write tool interrupts → bubbles up.
+        run_turn_with_subagents(
+            &store,
+            &FakeExec,
+            &provider,
+            &sink,
+            &params(false),
+            &AllowAll,
+            &reg,
+        )
+        .await
+        .unwrap();
+
+        match sink.events().last().unwrap() {
+            AguiEvent::RunFinished {
+                outcome, interrupt, ..
+            } => {
+                assert!(matches!(outcome, RunOutcome::Interrupt));
+                let itr = interrupt.as_ref().unwrap();
+                assert_eq!(itr.reason, "subagent_approval");
+                assert_eq!(itr.id, "del_1"); // keyed by the parent delegation id
+            }
+            _ => panic!("expected a bubbled subagent interrupt"),
+        }
+        assert_eq!(store.status(), "responding");
+        assert_eq!(store.tool_status("del_1").as_deref(), Some("pending"));
+
+        // 2) Approve → resume routes into the child, which completes; the parent
+        // then continues to a successful finish.
+        let resume_sink = VecSink::default();
+        let item = ResumeItem {
+            interrupt_id: "del_1".to_string(),
+            payload: ResumePayload { approved: true },
+        };
+        resume_with_subagents(
+            &store,
+            &FakeExec,
+            &provider,
+            &resume_sink,
+            &params(false),
+            &AllowAll,
+            &reg,
+            &item,
+        )
+        .await
+        .unwrap();
+
+        let names = resume_sink.names();
+        assert!(names.contains(&"TOOL_CALL_RESULT".to_string()));
+        match resume_sink.events().last().unwrap() {
+            AguiEvent::RunFinished { outcome, .. } => {
+                assert!(matches!(outcome, RunOutcome::Success));
+            }
+            _ => panic!("expected success after resume"),
+        }
+        assert_eq!(store.status(), "idle");
+        assert_eq!(store.tool_status("del_1").as_deref(), Some("success"));
+    }
+
+    #[tokio::test]
+    async fn subagent_denied_resume_still_finishes() {
+        let store = FakeStore::with_user("delegate please");
+        let sink = VecSink::default();
+        let provider = DelegatingProvider { tool: "worker".to_string() };
+        let reg = worker_registry();
+
+        run_turn_with_subagents(
+            &store, &FakeExec, &provider, &sink, &params(false), &AllowAll, &reg,
+        )
+        .await
+        .unwrap();
+        assert_eq!(store.status(), "responding");
+
+        // Deny the subagent's write; the child records the denial and finishes,
+        // and the parent run completes.
+        let resume_sink = VecSink::default();
+        let item = ResumeItem {
+            interrupt_id: "del_1".to_string(),
+            payload: ResumePayload { approved: false },
+        };
+        resume_with_subagents(
+            &store, &FakeExec, &provider, &resume_sink, &params(false), &AllowAll, &reg, &item,
+        )
+        .await
+        .unwrap();
+
+        match resume_sink.events().last().unwrap() {
+            AguiEvent::RunFinished { outcome, .. } => {
+                assert!(matches!(outcome, RunOutcome::Success));
+            }
+            _ => panic!("expected success after denied resume"),
+        }
+        assert_eq!(store.status(), "idle");
+        assert_eq!(store.tool_status("del_1").as_deref(), Some("success"));
     }
 }

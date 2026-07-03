@@ -191,10 +191,17 @@ impl ToolAuthorizer for AppAuthorizer {
 //         .with(SubagentExecutor::new(Arc::new(registry), sink));
 //     // ... then `run_turn(&store, &exec, &provider, &sink, &params, &authz)`.
 //
-// Note: subagents backed by the ephemeral in-memory store auto-approve their
-// own write tools. A subagent whose write tools should require *human* approval
-// that bubbles up to the parent needs a persistent child-conversation store so
-// its state survives the interrupt→resume round-trip.
+// Two delegation modes:
+//   * Composing `SubagentExecutor` into `exec` (above) runs subagents that
+//     auto-approve their own write tools — simplest, no human-in-the-loop.
+//   * To have a subagent's write tool require *human* approval that bubbles up
+//     to the parent as an interrupt, skip the composite and instead call the
+//     subagent-aware entry points, passing the registry directly:
+//         run_turn_with_subagents(&store, &exec, &provider, &sink, &params, &authz, &registry)
+//         resume_with_subagents(&store, &exec, &provider, &sink, &params, &authz, &registry, &item)
+//     The suspended child state rides in the parent's pending tool call, so no
+//     extra child-conversation table is required. Attach a review sink with
+//     `SubagentRegistry::default().with_sink(Arc::new(DbLoggingSink { .. }))`.
 
 // ---------------------------------------------------------------------------
 // Conversation store — maps the agent tables to the agui run-loop.
