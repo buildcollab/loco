@@ -161,10 +161,10 @@ impl ToolAuthorizer for AppAuthorizer {
 //         max_tool_turns: 4,
 //     });
 //     let sink = Arc::new(DbLoggingSink { db: ctx.db.clone(), conversation_id: conversation.id });
-//     let exec = CompositeToolExecutor::default()
+//     let exec = Arc::new(CompositeToolExecutor::default()
 //         .with(AgentTools)
-//         .with(SubagentExecutor::new(Arc::new(registry), sink));
-//     // ... then `run_turn(&store, &exec, &provider, &sink, &params, &authz)`.
+//         .with(SubagentExecutor::new(Arc::new(registry), sink)));
+//     // ... then `run_turn(&store, exec, &provider, &sink, &params, &authz)`.
 //
 // Two delegation modes:
 //   * Composing `SubagentExecutor` into `exec` (above) runs subagents that
@@ -172,8 +172,8 @@ impl ToolAuthorizer for AppAuthorizer {
 //   * To have a subagent's write tool require *human* approval that bubbles up
 //     to the parent as an interrupt, skip the composite and instead call the
 //     subagent-aware entry points, passing the registry directly:
-//         run_turn_with_subagents(&store, &exec, &provider, &sink, &params, &authz, &registry)
-//         resume_with_subagents(&store, &exec, &provider, &sink, &params, &authz, &registry, &item)
+//         run_turn_with_subagents(&store, exec, &provider, &sink, &params, &authz, &registry)
+//         resume_with_subagents(&store, exec, &provider, &sink, &params, &authz, &registry, &item)
 //     The suspended child state rides in the parent's pending tool call, so no
 //     extra child-conversation table is required. Attach a review sink with
 //     `SubagentRegistry::default().with_sink(Arc::new(DbLoggingSink { .. }))`.
@@ -551,17 +551,20 @@ pub async fn run(
         thread_id: conversation.pid.to_string(),
         auto_approve: false,
         max_tool_turns: 8,
+        // Optional per-tool-call deadline; each tool runs on its own task.
+        tool_timeout: None,
     };
     let resume_item = input.resume.first().cloned();
 
     let sse = spawn_and_stream(64, || {}, move |sink| async move {
-        let exec = AgentTools;
+        // `Arc`-shared so each tool call can run on (and be timed out on) its own task.
+        let exec = std::sync::Arc::new(AgentTools);
         // Authorize every tool call against the caller's scopes.
         let authz = AppAuthorizer { scopes };
         let result = if let Some(item) = resume_item {
-            resume(&store, &exec, &provider, &sink, &params, &authz, &item).await
+            resume(&store, exec, &provider, &sink, &params, &authz, &item).await
         } else {
-            run_turn(&store, &exec, &provider, &sink, &params, &authz).await
+            run_turn(&store, exec, &provider, &sink, &params, &authz).await
         };
         if let Err(err) = result {
             tracing::error!(error = %err, "agent run failed");

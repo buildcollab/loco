@@ -31,11 +31,14 @@
 //! `RUN_FINISHED(interrupt)` and leaves a `pending` tool call for [`resume`].
 
 use std::panic::AssertUnwindSafe;
-use std::time::Instant;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use futures_util::FutureExt;
 use serde_json::{json, Value};
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, error, info, instrument, warn};
 
 use crate::agui::protocol::{
     part_text, part_tool_result, part_tool_use, AguiEvent, Interrupt, ResumeItem, RunOutcome,
@@ -149,6 +152,18 @@ impl<T: ?Sized + ToolExecutor> ToolExecutor for Box<T> {
     }
 }
 
+/// Forwarding impl so `Arc<dyn ToolExecutor>` (the shared-owned form the run-loop
+/// uses to spawn each tool on its own task) is itself a `ToolExecutor`.
+#[async_trait::async_trait]
+impl<T: ?Sized + ToolExecutor> ToolExecutor for Arc<T> {
+    fn specs(&self) -> Vec<ToolSpec> {
+        (**self).specs()
+    }
+    async fn execute(&self, name: &str, args: Value) -> Result<Value> {
+        (**self).execute(name, args).await
+    }
+}
+
 /// Forwarding impl so `Box<dyn ToolAuthorizer>` is a `Sized` [`ToolAuthorizer`].
 #[async_trait::async_trait]
 impl<T: ?Sized + ToolAuthorizer> ToolAuthorizer for Box<T> {
@@ -214,6 +229,10 @@ pub struct RunParams {
     pub auto_approve: bool,
     /// Maximum provider turns (streaming rounds) before the loop stops.
     pub max_tool_turns: usize,
+    /// Optional per-tool-call deadline. Each tool runs on its own task; if it
+    /// exceeds this, the task is aborted and the call becomes an `error` result.
+    /// `None` = no deadline (still isolated on its own task, aborted on cancel).
+    pub tool_timeout: Option<Duration>,
 }
 
 /// Outcome of the inner streaming loop.
@@ -238,7 +257,7 @@ enum LoopResult {
 )]
 pub async fn run_turn<S, E, P, K, A>(
     store: &S,
-    exec: &E,
+    exec: Arc<E>,
     provider: &P,
     sink: &K,
     params: &RunParams,
@@ -246,7 +265,7 @@ pub async fn run_turn<S, E, P, K, A>(
 ) -> Result<()>
 where
     S: ConversationStore,
-    E: ToolExecutor,
+    E: ToolExecutor + 'static,
     P: Provider,
     K: EventSink,
     A: ToolAuthorizer,
@@ -268,7 +287,7 @@ where
 )]
 pub async fn run_turn_with_subagents<S, E, P, K, A>(
     store: &S,
-    exec: &E,
+    exec: Arc<E>,
     provider: &P,
     sink: &K,
     params: &RunParams,
@@ -277,7 +296,7 @@ pub async fn run_turn_with_subagents<S, E, P, K, A>(
 ) -> Result<()>
 where
     S: ConversationStore,
-    E: ToolExecutor,
+    E: ToolExecutor + 'static,
     P: Provider,
     K: EventSink,
     A: ToolAuthorizer,
@@ -288,7 +307,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn run_turn_impl<S, E, P, K, A>(
     store: &S,
-    exec: &E,
+    exec: Arc<E>,
     provider: &P,
     sink: &K,
     params: &RunParams,
@@ -297,7 +316,7 @@ async fn run_turn_impl<S, E, P, K, A>(
 ) -> Result<()>
 where
     S: ConversationStore,
-    E: ToolExecutor,
+    E: ToolExecutor + 'static,
     P: Provider,
     K: EventSink,
     A: ToolAuthorizer,
@@ -318,13 +337,13 @@ where
     .await?;
 
     let mut history = store.load_history().await?;
-    let specs = merged_specs(exec, subagents);
+    let specs = merged_specs(&*exec, subagents);
     let mut parts: Vec<Value> = Vec::new();
     let mut total_usage = Usage::default();
 
     let result = run_loop(
         store,
-        exec,
+        &exec,
         provider,
         sink,
         params,
@@ -371,7 +390,7 @@ fn merged_specs<E: ToolExecutor>(exec: &E, subagents: Option<&SubagentRegistry>)
 )]
 pub async fn resume<S, E, P, K, A>(
     store: &S,
-    exec: &E,
+    exec: Arc<E>,
     provider: &P,
     sink: &K,
     params: &RunParams,
@@ -380,7 +399,7 @@ pub async fn resume<S, E, P, K, A>(
 ) -> Result<()>
 where
     S: ConversationStore,
-    E: ToolExecutor,
+    E: ToolExecutor + 'static,
     P: Provider,
     K: EventSink,
     A: ToolAuthorizer,
@@ -402,7 +421,7 @@ where
 #[allow(clippy::too_many_arguments)]
 pub async fn resume_with_subagents<S, E, P, K, A>(
     store: &S,
-    exec: &E,
+    exec: Arc<E>,
     provider: &P,
     sink: &K,
     params: &RunParams,
@@ -412,7 +431,7 @@ pub async fn resume_with_subagents<S, E, P, K, A>(
 ) -> Result<()>
 where
     S: ConversationStore,
-    E: ToolExecutor,
+    E: ToolExecutor + 'static,
     P: Provider,
     K: EventSink,
     A: ToolAuthorizer,
@@ -423,7 +442,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn resume_impl<S, E, P, K, A>(
     store: &S,
-    exec: &E,
+    exec: Arc<E>,
     provider: &P,
     sink: &K,
     params: &RunParams,
@@ -433,7 +452,7 @@ async fn resume_impl<S, E, P, K, A>(
 ) -> Result<()>
 where
     S: ConversationStore,
-    E: ToolExecutor,
+    E: ToolExecutor + 'static,
     P: Provider,
     K: EventSink,
     A: ToolAuthorizer,
@@ -459,7 +478,7 @@ where
     .await?;
 
     let mut history = store.load_history().await?;
-    let specs = merged_specs(exec, subagents);
+    let specs = merged_specs(&*exec, subagents);
     let mut parts: Vec<Value> = Vec::new();
     let mut total_usage = Usage::default();
 
@@ -534,7 +553,7 @@ where
                     });
                     history.push(ChatMessage::tool_result(&display_call.id, &res.to_string()));
                     run_loop(
-                        store, exec, provider, sink, params, authz, subagents, &msg, &mut history,
+                        store, &exec, provider, sink, params, authz, subagents, &msg, &mut history,
                         &mut parts, &mut total_usage, &specs,
                     )
                     .await
@@ -563,7 +582,7 @@ where
                 // An approved call is already past its approval gate, so treat a
                 // repeated `RequireApproval` as an allow rather than looping.
                 ToolDecision::Allow | ToolDecision::RequireApproval { .. } => {
-                    execute_and_record(exec, store, &tref, &call).await?
+                    execute_and_record(&exec, store, &tref, &call, params.tool_timeout).await?
                 }
             };
             parts.push(part_tool_use(&call.id, &call.name, &call.arguments));
@@ -587,7 +606,7 @@ where
 
             run_loop(
                 store,
-                exec,
+                &exec,
                 provider,
                 sink,
                 params,
@@ -690,7 +709,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn run_loop<S, E, P, K, A>(
     store: &S,
-    exec: &E,
+    exec: &Arc<E>,
     provider: &P,
     sink: &K,
     params: &RunParams,
@@ -704,7 +723,7 @@ async fn run_loop<S, E, P, K, A>(
 ) -> Result<LoopResult>
 where
     S: ConversationStore,
-    E: ToolExecutor,
+    E: ToolExecutor + 'static,
     P: Provider,
     K: EventSink,
     A: ToolAuthorizer,
@@ -881,7 +900,8 @@ where
                     })
                     .await?;
 
-                    let (status, result) = execute_and_record(exec, store, &tref, call).await?;
+                    let (status, result) =
+                        execute_and_record(exec, store, &tref, call, params.tool_timeout).await?;
                     sink.emit(AguiEvent::ToolCallResult {
                         message_id: msg.id.clone(),
                         tool_call_id: call.id.clone(),
@@ -930,26 +950,82 @@ async fn catch_panic<T>(
     }
 }
 
-/// Execute a tool, time it, and record completion. Returns the `(status,
-/// result)` pair used for events and message parts. A panic in the tool is
-/// isolated into an `error` result (the loop keeps going).
+/// A [`JoinHandle`](tokio::task::JoinHandle) that aborts its task when dropped,
+/// so a tool spawned for a run is cancelled if the run-loop unwinds (client
+/// disconnect) or the call times out — never left orphaned. Awaiting it yields
+/// the task's [`JoinResult`](tokio::task::JoinError).
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl<T> std::future::Future for AbortOnDrop<T> {
+    type Output = std::result::Result<T, tokio::task::JoinError>;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.0).poll(cx)
+    }
+}
+
+/// Execute a tool **on its own task**, time it, and record completion. Returns
+/// the `(status, result)` pair used for events and message parts.
+///
+/// Isolation: the tool runs via [`tokio::spawn`], so a panic surfaces as a
+/// [`JoinError`](tokio::task::JoinError) → `error` result (the loop keeps going),
+/// an optional `timeout` aborts a slow tool → `error` result, and dropping the
+/// in-flight guard on run-loop cancellation aborts the tool task.
 async fn execute_and_record<E, S>(
-    exec: &E,
+    exec: &Arc<E>,
     store: &S,
     tref: &ToolRef,
     call: &ToolCallReq,
+    timeout: Option<Duration>,
 ) -> Result<(&'static str, Value)>
 where
-    E: ToolExecutor,
+    E: ToolExecutor + 'static,
     S: ConversationStore,
 {
     let start = Instant::now();
-    let res = catch_panic(&call.name, exec.execute(&call.name, call.arguments.clone())).await;
-    let ms = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
-    let (status, result) = match res {
-        Ok(v) => ("success", v),
-        Err(e) => ("error", json!({ "error": e.to_string() })),
+    let handle = tokio::spawn({
+        let exec = Arc::clone(exec);
+        let name = call.name.clone();
+        let args = call.arguments.clone();
+        async move { exec.execute(&name, args).await }
+    });
+    let guard = AbortOnDrop(handle);
+
+    let joined = match timeout {
+        Some(dur) => tokio::time::timeout(dur, guard).await,
+        None => Ok(guard.await),
     };
+    let ms = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
+
+    let (status, result) = match joined {
+        // Timed out — the guard was dropped, aborting the tool task.
+        Err(_elapsed) => {
+            warn!(target: "loco_rs::agui", tool = %call.name, duration_ms = ms, "tool call timed out");
+            (
+                "error",
+                json!({ "error": format!("tool timed out after {ms}ms") }),
+            )
+        }
+        // Panicked (or aborted) inside the task.
+        Ok(Err(join_err)) => {
+            if join_err.is_panic() {
+                let msg = panic_to_string(join_err.into_panic().as_ref());
+                error!(target: "loco_rs::agui", tool = %call.name, panic = %msg, "tool call panicked");
+                ("error", json!({ "error": format!("tool panicked: {msg}") }))
+            } else {
+                warn!(target: "loco_rs::agui", tool = %call.name, "tool call cancelled");
+                ("error", json!({ "error": "tool cancelled" }))
+            }
+        }
+        Ok(Ok(Ok(v))) => ("success", v),
+        Ok(Ok(Err(e))) => ("error", json!({ "error": e.to_string() })),
+    };
+
     debug!(
         target: "loco_rs::agui",
         tool = %call.name, status, duration_ms = ms, "tool call complete"
@@ -1331,6 +1407,7 @@ mod tests {
             thread_id: "thread1".to_string(),
             auto_approve,
             max_tool_turns: 5,
+            tool_timeout: None,
         }
     }
 
@@ -1342,7 +1419,7 @@ mod tests {
         let sink = VecSink::default();
         let provider = StubProvider::with_reply("hi there friend");
 
-        run_turn(&store, &FakeExec, &provider, &sink, &params(false), &AllowAll)
+        run_turn(&store, Arc::new(FakeExec), &provider, &sink, &params(false), &AllowAll)
             .await
             .unwrap();
 
@@ -1362,7 +1439,7 @@ mod tests {
         let sink = VecSink::default();
         let provider = StubProvider::new();
 
-        run_turn(&store, &FakeExec, &provider, &sink, &params(true), &AllowAll)
+        run_turn(&store, Arc::new(FakeExec), &provider, &sink, &params(true), &AllowAll)
             .await
             .unwrap();
 
@@ -1389,7 +1466,7 @@ mod tests {
         let sink = VecSink::default();
         let provider = StubProvider::new();
 
-        run_turn(&store, &FakeExec, &provider, &sink, &params(false), &AllowAll)
+        run_turn(&store, Arc::new(FakeExec), &provider, &sink, &params(false), &AllowAll)
             .await
             .unwrap();
 
@@ -1416,7 +1493,7 @@ mod tests {
         let sink = VecSink::default();
         let provider = StubProvider::new();
 
-        run_turn(&store, &FakeExec, &provider, &sink, &params(false), &AllowAll)
+        run_turn(&store, Arc::new(FakeExec), &provider, &sink, &params(false), &AllowAll)
             .await
             .unwrap();
         assert_eq!(store.status(), "responding");
@@ -1426,7 +1503,7 @@ mod tests {
             interrupt_id: "call_stub_save_note".to_string(),
             payload: ResumePayload { approved: true },
         };
-        resume(&store, &FakeExec, &provider, &resume_sink, &params(false), &AllowAll, &item)
+        resume(&store, Arc::new(FakeExec), &provider, &resume_sink, &params(false), &AllowAll, &item)
             .await
             .unwrap();
 
@@ -1452,7 +1529,7 @@ mod tests {
         let sink = VecSink::default();
         let provider = StubProvider::new();
 
-        run_turn(&store, &FakeExec, &provider, &sink, &params(false), &AllowAll)
+        run_turn(&store, Arc::new(FakeExec), &provider, &sink, &params(false), &AllowAll)
             .await
             .unwrap();
 
@@ -1461,7 +1538,7 @@ mod tests {
             interrupt_id: "call_stub_save_note".to_string(),
             payload: ResumePayload { approved: false },
         };
-        resume(&store, &FakeExec, &provider, &resume_sink, &params(false), &AllowAll, &item)
+        resume(&store, Arc::new(FakeExec), &provider, &resume_sink, &params(false), &AllowAll, &item)
             .await
             .unwrap();
 
@@ -1483,7 +1560,7 @@ mod tests {
 
         // auto_approve = true so the *only* thing that can stop execution is the
         // authorizer, not the built-in write gate.
-        run_turn(&store, &FakeExec, &provider, &sink, &params(true), &DenyAll)
+        run_turn(&store, Arc::new(FakeExec), &provider, &sink, &params(true), &DenyAll)
             .await
             .unwrap();
 
@@ -1524,7 +1601,7 @@ mod tests {
         // outright; RequireApproval must still force the interrupt.
         run_turn(
             &store,
-            &FakeExec,
+            Arc::new(FakeExec),
             &provider,
             &sink,
             &params(true),
@@ -1616,7 +1693,7 @@ mod tests {
             description: "does work with a write tool".to_string(),
             system: "you are a worker".to_string(),
             provider: StubProvider::new(),
-            exec: WriteExec,
+            exec: Arc::new(WriteExec),
             authz: AllowAll,
             max_tool_turns: 4,
         });
@@ -1633,7 +1710,7 @@ mod tests {
         // 1) Parent delegates → subagent's write tool interrupts → bubbles up.
         run_turn_with_subagents(
             &store,
-            &FakeExec,
+            Arc::new(FakeExec),
             &provider,
             &sink,
             &params(false),
@@ -1666,7 +1743,7 @@ mod tests {
         };
         resume_with_subagents(
             &store,
-            &FakeExec,
+            Arc::new(FakeExec),
             &provider,
             &resume_sink,
             &params(false),
@@ -1697,7 +1774,7 @@ mod tests {
         let reg = worker_registry();
 
         run_turn_with_subagents(
-            &store, &FakeExec, &provider, &sink, &params(false), &AllowAll, &reg,
+            &store, Arc::new(FakeExec), &provider, &sink, &params(false), &AllowAll, &reg,
         )
         .await
         .unwrap();
@@ -1711,7 +1788,7 @@ mod tests {
             payload: ResumePayload { approved: false },
         };
         resume_with_subagents(
-            &store, &FakeExec, &provider, &resume_sink, &params(false), &AllowAll, &reg, &item,
+            &store, Arc::new(FakeExec), &provider, &resume_sink, &params(false), &AllowAll, &reg, &item,
         )
         .await
         .unwrap();
@@ -1753,7 +1830,7 @@ mod tests {
 
         // (A "thread panicked at 'kaboom'" line on stderr here is expected — it's
         // the caught panic; the run still completes successfully.)
-        run_turn(&store, &PanicExec, &provider, &sink, &params(true), &AllowAll)
+        run_turn(&store, Arc::new(PanicExec), &provider, &sink, &params(true), &AllowAll)
             .await
             .unwrap();
 
@@ -1774,6 +1851,55 @@ mod tests {
             })
             .expect("a TOOL_CALL_RESULT");
         assert!(content.get("error").is_some());
+        assert_eq!(store.tool_status("del_1").as_deref(), Some("error"));
+    }
+
+    /// A tool that sleeps longer than any test timeout.
+    struct SlowExec;
+    #[async_trait::async_trait]
+    impl ToolExecutor for SlowExec {
+        fn specs(&self) -> Vec<ToolSpec> {
+            vec![ToolSpec {
+                name: "slow".to_string(),
+                description: "sleeps".to_string(),
+                parameters: json!({"type": "object"}),
+                kind: ToolKind::Read,
+            }]
+        }
+        async fn execute(&self, _name: &str, _args: Value) -> Result<Value> {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            Ok(json!({ "ok": true }))
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_timeout_aborts_and_yields_error() {
+        let store = FakeStore::with_user("go");
+        let sink = VecSink::default();
+        let provider = DelegatingProvider { tool: "slow".to_string() };
+        let mut p = params(true);
+        p.tool_timeout = Some(Duration::from_millis(20));
+
+        run_turn(&store, Arc::new(SlowExec), &provider, &sink, &p, &AllowAll)
+            .await
+            .unwrap();
+
+        // The slow tool was aborted at the deadline; the run still finished.
+        match sink.events().last().unwrap() {
+            AguiEvent::RunFinished { outcome, .. } => {
+                assert!(matches!(outcome, RunOutcome::Success));
+            }
+            _ => panic!("expected a successful RunFinished"),
+        }
+        let content = sink
+            .events()
+            .into_iter()
+            .find_map(|e| match e {
+                AguiEvent::ToolCallResult { content, .. } => Some(content),
+                _ => None,
+            })
+            .expect("a TOOL_CALL_RESULT");
+        assert!(content["error"].as_str().unwrap().contains("timed out"));
         assert_eq!(store.tool_status("del_1").as_deref(), Some("error"));
     }
 }
