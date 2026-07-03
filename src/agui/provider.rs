@@ -249,6 +249,7 @@ fn messages_to_json(system: &str, history: &[ChatMessage], cache_system: bool) -
 #[derive(Default)]
 pub struct StreamAssembler {
     text: String,
+    reasoning: String,
     tool_calls: BTreeMap<usize, PartialToolCall>,
     usage: Usage,
     finish_reason: Option<String>,
@@ -281,6 +282,17 @@ impl StreamAssembler {
                     self.text.push_str(content);
                     deltas.push(AgentDelta::TextDelta(content.to_string()));
                 }
+            }
+
+            // Some models (e.g. `nvidia/nemotron` behind `openrouter/free`) place
+            // their prose in an out-of-band `reasoning` field and leave `content`
+            // empty. Accumulate it so it isn't dropped; it is only used as the
+            // assistant text if `content` ends up empty (see `into_outcome`). It is
+            // deliberately not forwarded as a live `TextDelta` so genuine
+            // reasoning models that also fill `content` don't double-emit.
+            let reasoning = extract_reasoning(&delta);
+            if !reasoning.is_empty() {
+                self.reasoning.push_str(reasoning);
             }
 
             if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
@@ -357,14 +369,20 @@ impl StreamAssembler {
     /// Consume the assembler into a [`TurnOutcome`].
     #[must_use]
     pub fn into_outcome(self) -> TurnOutcome {
-        if self.tool_calls.is_empty() {
-            TurnOutcome::Final {
-                text: self.text,
-                usage: self.usage,
-            }
+        let Self {
+            text,
+            reasoning,
+            tool_calls,
+            usage,
+            ..
+        } = self;
+        // Fall back to `reasoning` when the visible `content` was empty so the
+        // assistant message isn't blank for reasoning-in-`reasoning` models.
+        let text = if text.is_empty() { reasoning } else { text };
+        if tool_calls.is_empty() {
+            TurnOutcome::Final { text, usage }
         } else {
-            let calls = self
-                .tool_calls
+            let calls = tool_calls
                 .into_values()
                 .map(|p| ToolCallReq {
                     id: p.id,
@@ -374,11 +392,22 @@ impl StreamAssembler {
                 .collect();
             TurnOutcome::Tools {
                 calls,
-                usage: self.usage,
-                partial_text: self.text,
+                usage,
+                partial_text: text,
             }
         }
     }
+}
+
+/// Extract a model's out-of-band reasoning text from a streaming `delta` or a
+/// non-streaming `message` object. OpenRouter surfaces it as `reasoning`; some
+/// OpenAI-compatible providers (e.g. DeepSeek) use `reasoning_content`. Returns
+/// `""` when neither is present.
+fn extract_reasoning(v: &Value) -> &str {
+    v.get("reasoning")
+        .and_then(Value::as_str)
+        .or_else(|| v.get("reasoning_content").and_then(Value::as_str))
+        .unwrap_or_default()
 }
 
 fn parse_args(raw: &str) -> Value {
@@ -835,11 +864,16 @@ fn parse_non_streaming(v: &Value) -> Result<TurnOutcome> {
         .and_then(|c| c.get("message"))
         .ok_or_else(|| Error::string("provider response missing choices[0].message"))?;
 
-    let text = message
+    let mut text = message
         .get("content")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    // Reasoning-in-`reasoning` models (e.g. `openrouter/free` -> nemotron) leave
+    // `content` empty; fall back to their reasoning text so nothing is lost.
+    if text.is_empty() {
+        text = extract_reasoning(message).to_string();
+    }
 
     if let Some(tcs) = message.get("tool_calls").and_then(Value::as_array) {
         if !tcs.is_empty() {
@@ -1212,6 +1246,101 @@ mod tests {
     }
 
     #[test]
+    fn assembler_openrouter_free_reasoning_with_tool_call() {
+        // Shape observed from `openrouter/free` (-> `nvidia/nemotron`): the prose
+        // arrives in `reasoning`, `content` stays empty, and the tool call is
+        // streamed normally. The tool call must survive and the reasoning prose
+        // must be surfaced rather than dropped.
+        let mut a = StreamAssembler::new();
+        a.ingest(&json!({"choices":[{"delta":{"reasoning":"I should list the tasks. "}}]}));
+        a.ingest(&json!({"choices":[{"delta":{"reasoning":"Calling list_tasks."}}]}));
+        a.ingest(&json!({"choices":[{"delta":{"tool_calls":[
+            {"index":0,"id":"call_1","function":{"name":"list_tasks","arguments":"{}"}}
+        ]}}]}));
+        a.ingest(&json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}));
+        a.ingest(&json!({"usage":{"prompt_tokens":20,"completion_tokens":5}}));
+
+        match a.into_outcome() {
+            TurnOutcome::Tools {
+                calls,
+                partial_text,
+                ..
+            } => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].name, "list_tasks");
+                assert_eq!(calls[0].arguments, json!({}));
+                assert!(partial_text.contains("list the tasks"));
+            }
+            TurnOutcome::Final { .. } => panic!("expected Tools"),
+        }
+    }
+
+    #[test]
+    fn assembler_reasoning_fallback_when_content_empty() {
+        let mut a = StreamAssembler::new();
+        a.ingest(&json!({"choices":[{"delta":{"reasoning":"Hello "}}]}));
+        a.ingest(&json!({"choices":[{"delta":{"reasoning":"there."}}]}));
+        a.ingest(&json!({"choices":[{"delta":{},"finish_reason":"stop"}]}));
+        match a.into_outcome() {
+            TurnOutcome::Final { text, .. } => assert_eq!(text, "Hello there."),
+            TurnOutcome::Tools { .. } => panic!("expected Final"),
+        }
+    }
+
+    #[test]
+    fn assembler_content_preferred_over_reasoning() {
+        // A genuine reasoning model that fills both fields must keep `content` as
+        // the visible answer and not leak its reasoning.
+        let mut a = StreamAssembler::new();
+        a.ingest(&json!({"choices":[{"delta":{"reasoning":"thinking..."}}]}));
+        a.ingest(&json!({"choices":[{"delta":{"content":"Answer"}}]}));
+        a.ingest(&json!({"choices":[{"delta":{},"finish_reason":"stop"}]}));
+        match a.into_outcome() {
+            TurnOutcome::Final { text, .. } => assert_eq!(text, "Answer"),
+            TurnOutcome::Tools { .. } => panic!("expected Final"),
+        }
+    }
+
+    #[test]
+    fn non_streaming_openrouter_free_reasoning_with_tool_call() {
+        // Non-streaming counterpart of the `openrouter/free` tool-call shape.
+        let v = json!({
+            "choices": [{"message": {
+                "content": "",
+                "reasoning": "I'll list the tasks now.",
+                "tool_calls": [
+                    {"id": "call_1", "function": {"name": "list_tasks", "arguments": "{}"}}
+                ]
+            }, "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 5}
+        });
+        match parse_non_streaming(&v).unwrap() {
+            TurnOutcome::Tools {
+                calls,
+                partial_text,
+                ..
+            } => {
+                assert_eq!(calls[0].name, "list_tasks");
+                assert!(partial_text.contains("list the tasks"));
+            }
+            TurnOutcome::Final { .. } => panic!("expected Tools"),
+        }
+    }
+
+    #[test]
+    fn non_streaming_reasoning_content_fallback() {
+        // DeepSeek-style `reasoning_content` field, empty `content`, no tools.
+        let v = json!({
+            "choices": [{"message": {"content": "", "reasoning_content": "Fallback answer."}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        });
+        match parse_non_streaming(&v).unwrap() {
+            TurnOutcome::Final { text, .. } => assert_eq!(text, "Fallback answer."),
+            TurnOutcome::Tools { .. } => panic!("expected Final"),
+        }
+    }
+
+    #[test]
     fn non_streaming_decode_tools() {
         let v = json!({
             "choices": [{"message": {"content": "", "tool_calls": [
@@ -1321,5 +1450,63 @@ mod tests {
         let p = RigProvider::new("k", None, "m").with_headers("https://example.com", "MyApp");
         assert_eq!(p.config.referer.as_deref(), Some("https://example.com"));
         assert_eq!(p.config.title.as_deref(), Some("MyApp"));
+    }
+
+    /// Live end-to-end verification that `openrouter/free` drives a tool call
+    /// through [`RigProvider`]. Ignored by default (needs network + a key); run
+    /// it explicitly to reproduce the "does the tool flow work" check:
+    ///
+    /// ```bash
+    /// OPENROUTER_API_KEY=sk-or-... \
+    ///   cargo test --features agui -p loco-rs \
+    ///   agui::provider::tests::live_openrouter_free_emits_tool_call -- --ignored --nocapture
+    /// ```
+    ///
+    /// It sends a prompt that can only be answered by listing tasks, exposing a
+    /// single read tool, and asserts the provider returns a [`TurnOutcome::Tools`]
+    /// naming that tool — i.e. the model calls tools and our parser assembles the
+    /// call regardless of whether prose landed in `content` or `reasoning`.
+    #[tokio::test]
+    #[ignore = "hits the live OpenRouter API; requires OPENROUTER_API_KEY"]
+    async fn live_openrouter_free_emits_tool_call() {
+        let api_key = std::env::var("OPENROUTER_API_KEY").unwrap_or_default();
+        if api_key.is_empty() {
+            eprintln!("skipping: OPENROUTER_API_KEY not set");
+            return;
+        }
+
+        let provider = RigProvider::new(api_key, None, "openrouter/free");
+        let tools = vec![ToolSpec {
+            name: "list_tasks".to_string(),
+            description: "List the user's current tasks.".to_string(),
+            parameters: json!({"type": "object", "properties": {}}),
+            kind: ToolKind::Read,
+        }];
+        let history = vec![ChatMessage::text(
+            "user",
+            "What tasks do I currently have? Use the available tool to find out.",
+        )];
+
+        let outcome = provider
+            .run_turn(
+                "You are a helpful assistant. Use tools when they can answer the question.",
+                &history,
+                &tools,
+            )
+            .await
+            .expect("provider request should succeed");
+
+        match outcome {
+            TurnOutcome::Tools { calls, .. } => {
+                assert!(
+                    calls.iter().any(|c| c.name == "list_tasks"),
+                    "expected a list_tasks call, got: {:?}",
+                    calls.iter().map(|c| &c.name).collect::<Vec<_>>()
+                );
+            }
+            TurnOutcome::Final { text, .. } => {
+                panic!("expected a tool call, got final text: {text:?}");
+            }
+        }
     }
 }
