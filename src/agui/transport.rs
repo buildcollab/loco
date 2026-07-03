@@ -40,6 +40,24 @@ pub trait EventSink: Send + Sync {
     async fn emit(&self, ev: AguiEvent) -> Result<()>;
 }
 
+/// Forwarding impl so `Box<dyn EventSink>` is itself a `Sized` [`EventSink`] —
+/// useful for holding an erased sink (e.g. a subagent's DB-logging sink).
+#[async_trait::async_trait]
+impl<T: ?Sized + EventSink> EventSink for Box<T> {
+    async fn emit(&self, ev: AguiEvent) -> Result<()> {
+        (**self).emit(ev).await
+    }
+}
+
+/// Forwarding impl so a `&dyn EventSink` satisfies the `EventSink` bound (e.g. a
+/// subagent handed an erased sink can pass it to `run_turn`).
+#[async_trait::async_trait]
+impl<T: ?Sized + EventSink> EventSink for &T {
+    async fn emit(&self, ev: AguiEvent) -> Result<()> {
+        (**self).emit(ev).await
+    }
+}
+
 /// An [`EventSink`] backed by an mpsc channel — the SSE path.
 pub struct MpscSink(pub mpsc::Sender<AguiEvent>);
 

@@ -33,6 +33,7 @@
 use std::time::Instant;
 
 use serde_json::{json, Value};
+use tracing::{debug, error, info, instrument};
 
 use crate::agui::protocol::{
     part_text, part_tool_result, part_tool_use, AguiEvent, Interrupt, ResumeItem, RunOutcome,
@@ -128,6 +129,27 @@ impl ToolAuthorizer for AllowAll {
     }
 }
 
+/// Forwarding impl so `Box<dyn ToolExecutor>` is a `Sized` [`ToolExecutor`] —
+/// needed to store heterogeneous executors (e.g. in a composite or a subagent
+/// registry) and still satisfy `run_turn`'s `Sized` generic bounds.
+#[async_trait::async_trait]
+impl<T: ?Sized + ToolExecutor> ToolExecutor for Box<T> {
+    fn specs(&self) -> Vec<ToolSpec> {
+        (**self).specs()
+    }
+    async fn execute(&self, name: &str, args: Value) -> Result<Value> {
+        (**self).execute(name, args).await
+    }
+}
+
+/// Forwarding impl so `Box<dyn ToolAuthorizer>` is a `Sized` [`ToolAuthorizer`].
+#[async_trait::async_trait]
+impl<T: ?Sized + ToolAuthorizer> ToolAuthorizer for Box<T> {
+    async fn authorize(&self, call: &ToolCallReq, kind: ToolKind) -> Result<ToolDecision> {
+        (**self).authorize(call, kind).await
+    }
+}
+
 /// App-supplied persistence for a single conversation. All ids returned here
 /// are public-id strings echoed back in emitted events.
 #[async_trait::async_trait]
@@ -201,6 +223,12 @@ enum LoopResult {
 /// # Errors
 /// Propagates provider/store/sink errors. On error, best-effort emits
 /// `RUN_ERROR`, sets status `errored`, and finalizes the message as `errored`.
+#[instrument(
+    target = "loco_rs::agui",
+    name = "agui.run_turn",
+    skip_all,
+    fields(run_id = %params.run_id, thread_id = %params.thread_id, model = %provider.model_id()),
+)]
 pub async fn run_turn<S, E, P, K, A>(
     store: &S,
     exec: &E,
@@ -259,6 +287,12 @@ where
 /// # Errors
 /// Errors if no `pending` tool call matches `item.interrupt_id`, or on
 /// provider/store/sink failure (same error handling as [`run_turn`]).
+#[instrument(
+    target = "loco_rs::agui",
+    name = "agui.resume",
+    skip_all,
+    fields(run_id = %params.run_id, thread_id = %params.thread_id, interrupt_id = %item.interrupt_id),
+)]
 pub async fn resume<S, E, P, K, A>(
     store: &S,
     exec: &E,
@@ -425,6 +459,7 @@ where
             Ok(())
         }
         Err(e) => {
+            error!(target: "loco_rs::agui", error = %e, run_id = %params.run_id, "agent run failed");
             // Best-effort teardown; ignore secondary errors.
             let _ = sink
                 .emit(AguiEvent::RunError {
@@ -512,6 +547,10 @@ where
                         ToolDecision::Deny { reason } => {
                             // Hard refusal: never execute. Record + surface a
                             // `denied` result the model can see, then move on.
+                            debug!(
+                                target: "loco_rs::agui",
+                                tool = %call.name, %reason, "authz denied tool call"
+                            );
                             let denied = json!({ "denied": true, "reason": reason });
                             let tref = store.record_tool_call(msg, call, "denied").await?;
                             store.complete_tool_call(&tref, "denied", &denied, 0).await?;
@@ -541,6 +580,10 @@ where
                     if let Some(reason) = interrupt_reason {
                         // Human-approval gate: record pending, interrupt, and
                         // finalize the message as still-streaming.
+                        info!(
+                            target: "loco_rs::agui",
+                            tool = %call.name, %reason, "raising approval interrupt"
+                        );
                         store.record_tool_call(msg, call, "pending").await?;
                         parts.push(part_tool_use(&call.id, &call.name, &call.arguments));
                         sink.emit(AguiEvent::RunFinished {
@@ -625,6 +668,10 @@ where
         Ok(v) => ("success", v),
         Err(e) => ("error", json!({ "error": e.to_string() })),
     };
+    debug!(
+        target: "loco_rs::agui",
+        tool = %call.name, status, duration_ms = ms, "tool call complete"
+    );
     store.complete_tool_call(tref, status, &result, ms).await?;
     Ok((status, result))
 }

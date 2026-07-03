@@ -61,7 +61,7 @@ cable_pg = ["dep:sqlx"]
 cable_sqlt = ["dep:sqlx"]
 cable_pgmq = ["dep:sqlx", "dep:pgmq"]
 # AG-UI streaming agent runtime (LLM agents over SSE). Off by default.
-agui = ["dep:reqwest", "tokio/sync", "tokio/rt", "tokio/macros"]
+agui = ["dep:reqwest", "tokio/sync", "tokio/rt", "tokio/macros", "tokio/time"]
 ## Testing feature flags
 integration_test = []
 # Embed assets into binary

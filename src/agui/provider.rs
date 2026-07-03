@@ -14,6 +14,8 @@
 
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::time::Duration;
+use tracing::{debug, warn};
 
 use crate::{Error, Result};
 
@@ -188,10 +190,24 @@ fn tools_to_json(tools: &[ToolSpec]) -> Vec<Value> {
         .collect()
 }
 
-fn messages_to_json(system: &str, history: &[ChatMessage]) -> Vec<Value> {
+fn messages_to_json(system: &str, history: &[ChatMessage], cache_system: bool) -> Vec<Value> {
     let mut out = Vec::with_capacity(history.len() + 1);
     if !system.is_empty() {
-        out.push(json!({ "role": "system", "content": system }));
+        // With `cache_system`, mark the (large, stable) system prompt as a cache
+        // breakpoint so Anthropic models via OpenRouter reuse it across turns.
+        // OpenAI-family models cache automatically and ignore the annotation.
+        if cache_system {
+            out.push(json!({
+                "role": "system",
+                "content": [{
+                    "type": "text",
+                    "text": system,
+                    "cache_control": { "type": "ephemeral" },
+                }],
+            }));
+        } else {
+            out.push(json!({ "role": "system", "content": system }));
+        }
     }
     for m in history {
         if m.role == "tool" {
@@ -388,6 +404,36 @@ fn parse_usage(v: &Value) -> Usage {
     }
 }
 
+/// Forwarding impl so `Box<dyn Provider>` is itself a `Sized` [`Provider`],
+/// letting a heterogeneous registry (e.g. subagents) hold boxed providers and
+/// still satisfy `run_turn`'s `Sized` generic bounds.
+#[async_trait::async_trait]
+impl<T: ?Sized + Provider> Provider for Box<T> {
+    fn model_id(&self) -> String {
+        (**self).model_id()
+    }
+    fn provider_name(&self) -> String {
+        (**self).provider_name()
+    }
+    async fn run_turn(
+        &self,
+        system: &str,
+        history: &[ChatMessage],
+        tools: &[ToolSpec],
+    ) -> Result<TurnOutcome> {
+        (**self).run_turn(system, history, tools).await
+    }
+    async fn stream_turn(
+        &self,
+        system: &str,
+        history: &[ChatMessage],
+        tools: &[ToolSpec],
+        tx: &tokio::sync::mpsc::Sender<AgentDelta>,
+    ) -> Result<TurnOutcome> {
+        (**self).stream_turn(system, history, tools, tx).await
+    }
+}
+
 // ---------------------------------------------------------------------------
 // RigProvider — OpenAI-compatible client (OpenRouter by default)
 // ---------------------------------------------------------------------------
@@ -407,26 +453,215 @@ pub struct RigProvider {
     base_url: String,
     model: String,
     client: reqwest::Client,
+    /// Tunables (headers, sampling params, caching, resiliency).
+    config: RigConfig,
+}
+
+/// Optional tunables for [`RigProvider`]. Defaults leave the request body and
+/// headers exactly as before this struct existed.
+#[derive(Debug, Clone)]
+pub struct RigConfig {
+    /// OpenRouter `HTTP-Referer` attribution header.
+    pub referer: Option<String>,
+    /// OpenRouter `X-Title` attribution header.
+    pub title: Option<String>,
+    /// Sampling temperature (omitted when `None`).
+    pub temperature: Option<f64>,
+    /// Max output tokens (omitted when `None`).
+    pub max_tokens: Option<i64>,
+    /// Nucleus sampling `top_p` (omitted when `None`).
+    pub top_p: Option<f64>,
+    /// Mark the system prompt as a cache breakpoint (Anthropic via OpenRouter).
+    pub cache_system: bool,
+    /// Max retry attempts for transient failures (429 / 5xx / connect).
+    pub max_retries: usize,
+    /// Idle timeout between streamed chunks before aborting a stalled stream.
+    pub idle_timeout: Duration,
+    /// Overall timeout for a non-streaming request.
+    pub request_timeout: Duration,
+    /// TCP connect timeout.
+    pub connect_timeout: Duration,
+}
+
+impl Default for RigConfig {
+    fn default() -> Self {
+        Self {
+            referer: None,
+            title: None,
+            temperature: None,
+            max_tokens: None,
+            top_p: None,
+            cache_system: false,
+            max_retries: 2,
+            idle_timeout: Duration::from_secs(60),
+            request_timeout: Duration::from_secs(120),
+            connect_timeout: Duration::from_secs(10),
+        }
+    }
 }
 
 impl RigProvider {
-    /// Build a provider. `base_url` defaults to [`OPENROUTER_BASE_URL`] when `None`.
+    /// Build a provider with default tunables. `base_url` defaults to
+    /// [`OPENROUTER_BASE_URL`] when `None`.
     #[must_use]
     pub fn new(
         api_key: impl Into<String>,
         base_url: Option<String>,
         model: impl Into<String>,
     ) -> Self {
+        Self::with_config(api_key, base_url, model, RigConfig::default())
+    }
+
+    /// Build a provider with explicit [`RigConfig`] tunables.
+    #[must_use]
+    pub fn with_config(
+        api_key: impl Into<String>,
+        base_url: Option<String>,
+        model: impl Into<String>,
+        config: RigConfig,
+    ) -> Self {
+        let client = reqwest::Client::builder()
+            .connect_timeout(config.connect_timeout)
+            .build()
+            .unwrap_or_default();
         Self {
             api_key: api_key.into(),
             base_url: base_url.unwrap_or_else(|| OPENROUTER_BASE_URL.to_string()),
             model: model.into(),
-            client: reqwest::Client::new(),
+            client,
+            config,
         }
+    }
+
+    /// Set OpenRouter attribution headers (builder style).
+    #[must_use]
+    pub fn with_headers(
+        mut self,
+        referer: impl Into<String>,
+        title: impl Into<String>,
+    ) -> Self {
+        self.config.referer = Some(referer.into());
+        self.config.title = Some(title.into());
+        self
+    }
+
+    /// Set sampling parameters (builder style); pass `None` to leave a param off.
+    #[must_use]
+    pub fn with_sampling(
+        mut self,
+        temperature: Option<f64>,
+        max_tokens: Option<i64>,
+        top_p: Option<f64>,
+    ) -> Self {
+        self.config.temperature = temperature;
+        self.config.max_tokens = max_tokens;
+        self.config.top_p = top_p;
+        self
+    }
+
+    /// Enable a system-prompt cache breakpoint (builder style).
+    #[must_use]
+    pub fn with_cache_system(mut self, cache_system: bool) -> Self {
+        self.config.cache_system = cache_system;
+        self
     }
 
     fn endpoint(&self) -> String {
         format!("{}/chat/completions", self.base_url.trim_end_matches('/'))
+    }
+
+    /// Base request body shared by streaming and non-streaming turns.
+    fn build_body(&self, system: &str, history: &[ChatMessage], tools: &[ToolSpec]) -> Value {
+        let mut body = json!({
+            "model": self.model,
+            "messages": messages_to_json(system, history, self.config.cache_system),
+        });
+        if !tools.is_empty() {
+            body["tools"] = Value::Array(tools_to_json(tools));
+        }
+        if let Some(t) = self.config.temperature {
+            body["temperature"] = json!(t);
+        }
+        if let Some(m) = self.config.max_tokens {
+            body["max_tokens"] = json!(m);
+        }
+        if let Some(p) = self.config.top_p {
+            body["top_p"] = json!(p);
+        }
+        body
+    }
+
+    /// Attach auth + optional OpenRouter attribution headers.
+    fn prepare(&self, body: &Value, timeout: Option<Duration>) -> reqwest::RequestBuilder {
+        let mut req = self
+            .client
+            .post(self.endpoint())
+            .bearer_auth(&self.api_key)
+            .json(body);
+        if let Some(referer) = &self.config.referer {
+            req = req.header("HTTP-Referer", referer);
+        }
+        if let Some(title) = &self.config.title {
+            req = req.header("X-Title", title);
+        }
+        if let Some(t) = timeout {
+            req = req.timeout(t);
+        }
+        req
+    }
+
+    /// Send the request, retrying transient failures (429 / 5xx / connect /
+    /// timeout) with exponential backoff. Returns the successful (2xx) response;
+    /// safe for streaming because retries happen before any body is read.
+    async fn send_with_retry(
+        &self,
+        body: &Value,
+        timeout: Option<Duration>,
+        streaming: bool,
+    ) -> Result<reqwest::Response> {
+        let mut attempt: u32 = 0;
+        loop {
+            debug!(
+                target: "loco_rs::agui",
+                model = %self.model, streaming, attempt, "provider request"
+            );
+            match self.prepare(body, timeout).send().await {
+                Ok(resp) if resp.status().is_success() => return Ok(resp),
+                Ok(resp) => {
+                    let status = resp.status();
+                    let retry_after = parse_retry_after(&resp);
+                    let text = resp.text().await.unwrap_or_default();
+                    if is_retryable_status(status) && attempt < self.config.max_retries as u32 {
+                        let delay = retry_after.unwrap_or_else(|| backoff_delay(attempt));
+                        warn!(
+                            target: "loco_rs::agui",
+                            %status, attempt, backoff_ms = delay.as_millis() as u64,
+                            "provider retry (status)"
+                        );
+                        tokio::time::sleep(delay).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(Error::Message(format!(
+                        "provider returned {status}: {text}"
+                    )));
+                }
+                Err(e) => {
+                    if is_retryable_err(&e) && attempt < self.config.max_retries as u32 {
+                        let delay = backoff_delay(attempt);
+                        warn!(
+                            target: "loco_rs::agui",
+                            error = %e, attempt, backoff_ms = delay.as_millis() as u64,
+                            "provider retry (transport)"
+                        );
+                        tokio::time::sleep(delay).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(Error::Message(format!("provider request failed: {e}")));
+                }
+            }
+        }
     }
 }
 
@@ -446,36 +681,18 @@ impl Provider for RigProvider {
         history: &[ChatMessage],
         tools: &[ToolSpec],
     ) -> Result<TurnOutcome> {
-        let mut body = json!({
-            "model": self.model,
-            "messages": messages_to_json(system, history),
-        });
-        if !tools.is_empty() {
-            body["tools"] = Value::Array(tools_to_json(tools));
-        }
-
+        let body = self.build_body(system, history, tools);
         let resp = self
-            .client
-            .post(self.endpoint())
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| Error::Message(format!("provider request failed: {e}")))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(Error::Message(format!(
-                "provider returned {status}: {text}"
-            )));
-        }
+            .send_with_retry(&body, Some(self.config.request_timeout), false)
+            .await?;
 
         let v: Value = resp
             .json()
             .await
             .map_err(|e| Error::Message(format!("provider response decode failed: {e}")))?;
-        parse_non_streaming(&v)
+        let outcome = parse_non_streaming(&v)?;
+        debug!(target: "loco_rs::agui", usage = ?outcome_usage(&outcome), "provider turn done");
+        Ok(outcome)
     }
 
     async fn stream_turn(
@@ -487,53 +704,47 @@ impl Provider for RigProvider {
     ) -> Result<TurnOutcome> {
         use futures_util::StreamExt;
 
-        let mut body = json!({
-            "model": self.model,
-            "messages": messages_to_json(system, history),
-            "stream": true,
-            "stream_options": { "include_usage": true },
-        });
-        if !tools.is_empty() {
-            body["tools"] = Value::Array(tools_to_json(tools));
-        }
+        let mut body = self.build_body(system, history, tools);
+        body["stream"] = json!(true);
+        body["stream_options"] = json!({ "include_usage": true });
 
-        let resp = self
-            .client
-            .post(self.endpoint())
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| Error::Message(format!("provider request failed: {e}")))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(Error::Message(format!(
-                "provider returned {status}: {text}"
-            )));
-        }
+        // No overall timeout on a stream; the connect timeout + per-chunk idle
+        // timeout below bound it. Retries happen before the first byte is read.
+        let resp = self.send_with_retry(&body, None, true).await?;
 
         let mut assembler = StreamAssembler::new();
         let mut stream = resp.bytes_stream();
-        let mut buf = String::new();
+        // Buffer raw bytes (not lossy-decoded strings) so a multi-byte codepoint
+        // split across two chunks is never corrupted; decode on line boundaries.
+        let mut buf: Vec<u8> = Vec::new();
 
-        while let Some(chunk) = stream.next().await {
-            let bytes =
-                chunk.map_err(|e| Error::Message(format!("provider stream error: {e}")))?;
-            buf.push_str(&String::from_utf8_lossy(&bytes));
+        loop {
+            let next = tokio::time::timeout(self.config.idle_timeout, stream.next()).await;
+            let chunk = match next {
+                Ok(Some(chunk)) => {
+                    chunk.map_err(|e| Error::Message(format!("provider stream error: {e}")))?
+                }
+                Ok(None) => break, // stream ended
+                Err(_) => {
+                    return Err(Error::Message(format!(
+                        "provider stream idle for {}s",
+                        self.config.idle_timeout.as_secs()
+                    )))
+                }
+            };
+            buf.extend_from_slice(&chunk);
 
             // Process complete lines; keep any trailing partial line in `buf`.
-            while let Some(nl) = buf.find('\n') {
-                let line = buf[..nl].trim().to_string();
-                buf.drain(..=nl);
+            for line in drain_lines(&mut buf) {
                 let Some(data) = line.strip_prefix("data:") else {
                     continue;
                 };
                 let data = data.trim();
                 if data == "[DONE]" {
                     let _ = tx.send(assembler.done_delta()).await;
-                    return Ok(assembler.into_outcome());
+                    let outcome = assembler.into_outcome();
+                    debug!(target: "loco_rs::agui", usage = ?outcome_usage(&outcome), "provider stream done");
+                    return Ok(outcome);
                 }
                 let Ok(json) = serde_json::from_str::<Value>(data) else {
                     continue;
@@ -549,7 +760,65 @@ impl Provider for RigProvider {
 
         // Stream ended without an explicit [DONE].
         let _ = tx.send(assembler.done_delta()).await;
-        Ok(assembler.into_outcome())
+        let outcome = assembler.into_outcome();
+        debug!(target: "loco_rs::agui", usage = ?outcome_usage(&outcome), "provider stream done");
+        Ok(outcome)
+    }
+}
+
+/// Drain complete `\n`-terminated lines from a raw byte buffer, decoding each
+/// full line as UTF-8. Decoding a *complete* line (only after its trailing
+/// newline has arrived) means a multi-byte codepoint split across two network
+/// chunks is never corrupted — the fix for the prior per-chunk `from_utf8_lossy`.
+/// Any trailing partial line stays buffered for the next chunk.
+fn drain_lines(buf: &mut Vec<u8>) -> Vec<String> {
+    let mut lines = Vec::new();
+    while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+        let line_bytes: Vec<u8> = buf.drain(..=nl).collect();
+        let line = String::from_utf8_lossy(&line_bytes[..line_bytes.len() - 1]);
+        lines.push(line.trim().to_string());
+    }
+    lines
+}
+
+/// Whether an HTTP status is worth retrying (rate limit or server error).
+fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+/// Whether a transport error is transient (connect/timeout/request-send).
+fn is_retryable_err(e: &reqwest::Error) -> bool {
+    e.is_connect() || e.is_timeout() || e.is_request()
+}
+
+/// Exponential backoff with light jitter: ~0.5s, 1s, 2s, … capped at 8s.
+fn backoff_delay(attempt: u32) -> Duration {
+    let base_ms = 500u64.saturating_mul(1u64 << attempt.min(4));
+    let capped = base_ms.min(8_000);
+    // Cheap deterministic-ish jitter (0..128ms) from the system clock nanos.
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()) % 128)
+        .unwrap_or(0);
+    Duration::from_millis(capped + jitter)
+}
+
+/// Parse a `Retry-After` header (delta-seconds form) into a duration.
+fn parse_retry_after(resp: &reqwest::Response) -> Option<Duration> {
+    resp.headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+}
+
+/// Extract the [`Usage`] from an outcome (for logging only).
+fn outcome_usage(outcome: &TurnOutcome) -> &Usage {
+    match outcome {
+        TurnOutcome::Final { usage, .. } | TurnOutcome::Tools { usage, .. } => usage,
     }
 }
 
@@ -957,5 +1226,100 @@ mod tests {
             }
             TurnOutcome::Final { .. } => panic!("expected Tools"),
         }
+    }
+
+    // ----- Stage 1: resiliency / caching / config ---------------------------
+
+    #[test]
+    fn utf8_codepoint_split_across_chunks_is_intact() {
+        // "café ☕" as SSE data, with the multi-byte 'é' (0xC3 0xA9) and the
+        // emoji split across two buffer appends. The old per-chunk
+        // `from_utf8_lossy` would corrupt these; `drain_lines` must not.
+        let full = "data: caf\u{e9} \u{2615}\n".as_bytes().to_vec();
+        let split = full.len() - 3; // slice through a multi-byte sequence
+        let mut buf: Vec<u8> = Vec::new();
+
+        buf.extend_from_slice(&full[..split]);
+        assert!(drain_lines(&mut buf).is_empty(), "no complete line yet");
+        buf.extend_from_slice(&full[split..]);
+        let lines = drain_lines(&mut buf);
+
+        assert_eq!(lines, vec!["data: caf\u{e9} \u{2615}".to_string()]);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn drain_lines_keeps_partial_trailing_line() {
+        let mut buf = b"data: a\ndata: b".to_vec();
+        let lines = drain_lines(&mut buf);
+        assert_eq!(lines, vec!["data: a".to_string()]);
+        // The partial "data: b" (no newline) stays buffered.
+        assert_eq!(buf, b"data: b");
+    }
+
+    #[test]
+    fn retryable_status_classification() {
+        use reqwest::StatusCode;
+        assert!(is_retryable_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_retryable_status(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(is_retryable_status(StatusCode::BAD_GATEWAY));
+        assert!(!is_retryable_status(StatusCode::BAD_REQUEST));
+        assert!(!is_retryable_status(StatusCode::UNAUTHORIZED));
+        assert!(!is_retryable_status(StatusCode::OK));
+    }
+
+    #[test]
+    fn backoff_grows_and_is_capped() {
+        let d0 = backoff_delay(0).as_millis();
+        let d1 = backoff_delay(1).as_millis();
+        // Base grows ~2x per attempt (jitter is < 128ms, base starts at 500ms).
+        assert!(d0 >= 500 && d0 < 700);
+        assert!(d1 >= 1000 && d1 < 1200);
+        // Capped at 8s + jitter regardless of attempt.
+        assert!(backoff_delay(20).as_millis() <= 8_128);
+    }
+
+    #[test]
+    fn messages_to_json_cache_breakpoint_opt_in() {
+        let hist = vec![ChatMessage::text("user", "hi")];
+        // Off: plain string system content.
+        let plain = messages_to_json("sys", &hist, false);
+        assert_eq!(plain[0]["content"], json!("sys"));
+        // On: array content with an ephemeral cache_control breakpoint.
+        let cached = messages_to_json("sys", &hist, true);
+        assert_eq!(cached[0]["content"][0]["type"], "text");
+        assert_eq!(cached[0]["content"][0]["text"], "sys");
+        assert_eq!(
+            cached[0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+    }
+
+    #[test]
+    fn build_body_folds_sampling_and_cache_only_when_set() {
+        // Defaults: no sampling params, plain system content.
+        let base = RigProvider::new("k", None, "m");
+        let b0 = base.build_body("sys", &[], &[]);
+        assert!(b0.get("temperature").is_none());
+        assert!(b0.get("max_tokens").is_none());
+        assert!(b0.get("top_p").is_none());
+        assert_eq!(b0["messages"][0]["content"], json!("sys"));
+
+        // Configured: params appear; system prompt is a cache breakpoint.
+        let tuned = RigProvider::new("k", None, "m")
+            .with_sampling(Some(0.2), Some(256), Some(0.9))
+            .with_cache_system(true);
+        let b1 = tuned.build_body("sys", &[], &[]);
+        assert_eq!(b1["temperature"], json!(0.2));
+        assert_eq!(b1["max_tokens"], json!(256));
+        assert_eq!(b1["top_p"], json!(0.9));
+        assert_eq!(b1["messages"][0]["content"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn with_headers_sets_attribution() {
+        let p = RigProvider::new("k", None, "m").with_headers("https://example.com", "MyApp");
+        assert_eq!(p.config.referer.as_deref(), Some("https://example.com"));
+        assert_eq!(p.config.title.as_deref(), Some("MyApp"));
     }
 }
