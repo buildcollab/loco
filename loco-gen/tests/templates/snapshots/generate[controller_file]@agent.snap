@@ -117,6 +117,61 @@ impl ToolAuthorizer for AppAuthorizer {
 }
 
 // ---------------------------------------------------------------------------
+// OPTIONAL: subagents with local tool calls.
+// ---------------------------------------------------------------------------
+//
+// A subagent is a child agent the model can delegate a task to. It runs its own
+// turn-loop with its own *local* (in-process) `ToolExecutor`, streams its events
+// to its own sink (e.g. persisted to a table for review), and returns its final
+// text to the parent as a tool result. Expose subagents to the parent by
+// composing a `SubagentExecutor` with `AgentTools` via `CompositeToolExecutor`.
+//
+// This is commented out so the generated controller compiles as-is. To enable,
+// add the imports:
+//     use loco_rs::agui::{
+//         CompositeToolExecutor, LocalSubagent, RigProvider, SubagentExecutor,
+//         SubagentRegistry, AllowAll, EventSink, AguiEvent,
+//     };
+//     use std::sync::Arc;
+//
+// A DB-logging sink for subagent runs (persist each event for debugging/review):
+//
+//     struct DbLoggingSink { db: DatabaseConnection, conversation_id: i32 }
+//     #[async_trait]
+//     impl EventSink for DbLoggingSink {
+//         async fn emit(&self, ev: AguiEvent) -> Result<()> {
+//             // INSERT a row: (conversation_id, event_name, serde_json::to_value(&ev))
+//             let _ = (&self.db, self.conversation_id, ev);
+//             Ok(())
+//         }
+//     }
+//
+// Build the composite executor inside the `run` handler and pass it to
+// `run_turn`/`resume` instead of `AgentTools`:
+//
+//     let api_key = std::env::var("OPENROUTER_API_KEY").unwrap_or_default();
+//     let mut registry = SubagentRegistry::default();
+//     registry.register(LocalSubagent {
+//         name: "summarizer".to_string(),
+//         description: "Summarize the provided text into a few sentences.".to_string(),
+//         system: "You are a concise summarizer.".to_string(),
+//         provider: RigProvider::new(api_key.clone(), None, agent.model.clone()),
+//         exec: AgentTools,      // the subagent's own local tools
+//         authz: AllowAll,       // the subagent's own authorization policy
+//         max_tool_turns: 4,
+//     });
+//     let sink = Arc::new(DbLoggingSink { db: ctx.db.clone(), conversation_id: conversation.id });
+//     let exec = CompositeToolExecutor::default()
+//         .with(AgentTools)
+//         .with(SubagentExecutor::new(Arc::new(registry), sink));
+//     // ... then `run_turn(&store, &exec, &provider, &sink, &params, &authz)`.
+//
+// Note: subagents backed by the ephemeral in-memory store auto-approve their
+// own write tools. A subagent whose write tools should require *human* approval
+// that bubbles up to the parent needs a persistent child-conversation store so
+// its state survives the interrupt→resume round-trip.
+
+// ---------------------------------------------------------------------------
 // Conversation store — maps the agent tables to the agui run-loop.
 // ---------------------------------------------------------------------------
 
