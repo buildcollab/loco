@@ -30,8 +30,10 @@
 //! A write tool without `auto_approve` short-circuits to
 //! `RUN_FINISHED(interrupt)` and leaves a `pending` tool call for [`resume`].
 
+use std::panic::AssertUnwindSafe;
 use std::time::Instant;
 
+use futures_util::FutureExt;
 use serde_json::{json, Value};
 use tracing::{debug, error, info, instrument};
 
@@ -491,9 +493,11 @@ where
         };
         let child_sink = reg.child_sink();
         let result: Result<LoopResult> = async {
-            match agent
-                .resume_step(state, item.payload.approved, &ctx, child_sink.as_ref())
-                .await
+            match catch_panic(
+                &pending.name,
+                agent.resume_step(state, item.payload.approved, &ctx, child_sink.as_ref()),
+            )
+            .await
             {
                 Ok(SubagentStep::Interrupted { interrupt, state }) => {
                     bubble_subagent_interrupt(
@@ -830,7 +834,9 @@ where
                             max_depth: reg.max_depth(),
                         };
                         let child_sink = reg.child_sink();
-                        match agent.start(input, &ctx, child_sink.as_ref()).await {
+                        match catch_panic(&call.name, agent.start(input, &ctx, child_sink.as_ref()))
+                            .await
+                        {
                             Ok(SubagentStep::Done(out)) => {
                                 let result = json!({ "output": out.text });
                                 record_delegation_result(
@@ -893,8 +899,40 @@ where
     Ok(LoopResult::Completed)
 }
 
+/// Turn a caught panic payload into a readable message.
+fn panic_to_string(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = panic.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+/// Run a tool (or subagent) future with panic isolation: a panic during polling
+/// is caught and returned as `Err` instead of unwinding — and killing — the
+/// run-loop. `subject` names the tool for the log line.
+///
+/// This runs the future on the same task (no `spawn`, so no `Send + 'static`
+/// bound), catching only unwinding panics (not `panic = "abort"`).
+async fn catch_panic<T>(
+    subject: &str,
+    fut: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    match AssertUnwindSafe(fut).catch_unwind().await {
+        Ok(res) => res,
+        Err(panic) => {
+            let msg = panic_to_string(panic.as_ref());
+            error!(target: "loco_rs::agui", tool = %subject, panic = %msg, "tool call panicked");
+            Err(Error::Message(format!("tool panicked: {msg}")))
+        }
+    }
+}
+
 /// Execute a tool, time it, and record completion. Returns the `(status,
-/// result)` pair used for events and message parts.
+/// result)` pair used for events and message parts. A panic in the tool is
+/// isolated into an `error` result (the loop keeps going).
 async fn execute_and_record<E, S>(
     exec: &E,
     store: &S,
@@ -906,7 +944,7 @@ where
     S: ConversationStore,
 {
     let start = Instant::now();
-    let res = exec.execute(&call.name, call.arguments.clone()).await;
+    let res = catch_panic(&call.name, exec.execute(&call.name, call.arguments.clone())).await;
     let ms = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
     let (status, result) = match res {
         Ok(v) => ("success", v),
@@ -1686,5 +1724,56 @@ mod tests {
         }
         assert_eq!(store.status(), "idle");
         assert_eq!(store.tool_status("del_1").as_deref(), Some("success"));
+    }
+
+    // ----- panic isolation ---------------------------------------------------
+
+    /// A tool that panics when executed.
+    struct PanicExec;
+    #[async_trait::async_trait]
+    impl ToolExecutor for PanicExec {
+        fn specs(&self) -> Vec<ToolSpec> {
+            vec![ToolSpec {
+                name: "boom".to_string(),
+                description: "panics".to_string(),
+                parameters: json!({"type": "object"}),
+                kind: ToolKind::Read,
+            }]
+        }
+        async fn execute(&self, _name: &str, _args: Value) -> Result<Value> {
+            panic!("kaboom");
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_panic_is_isolated_as_error_and_run_continues() {
+        let store = FakeStore::with_user("go");
+        let sink = VecSink::default();
+        let provider = DelegatingProvider { tool: "boom".to_string() };
+
+        // (A "thread panicked at 'kaboom'" line on stderr here is expected — it's
+        // the caught panic; the run still completes successfully.)
+        run_turn(&store, &PanicExec, &provider, &sink, &params(true), &AllowAll)
+            .await
+            .unwrap();
+
+        // The run finished successfully despite the panicking tool.
+        match sink.events().last().unwrap() {
+            AguiEvent::RunFinished { outcome, .. } => {
+                assert!(matches!(outcome, RunOutcome::Success));
+            }
+            _ => panic!("expected a successful RunFinished"),
+        }
+        // The panic surfaced as an `error` tool result, not a crash.
+        let content = sink
+            .events()
+            .into_iter()
+            .find_map(|e| match e {
+                AguiEvent::ToolCallResult { content, .. } => Some(content),
+                _ => None,
+            })
+            .expect("a TOOL_CALL_RESULT");
+        assert!(content.get("error").is_some());
+        assert_eq!(store.tool_status("del_1").as_deref(), Some("error"));
     }
 }
