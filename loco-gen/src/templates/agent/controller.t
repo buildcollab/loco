@@ -142,6 +142,68 @@ impl ToolAuthorizer for AppAuthorizer {
 }
 
 // ---------------------------------------------------------------------------
+// OPTIONAL: subagents with local tool calls.
+// ---------------------------------------------------------------------------
+//
+// A subagent is a child agent the model can delegate a task to. It runs its own
+// turn-loop with its own *local* (in-process) `ToolExecutor`, streams its events
+// to its own sink (e.g. persisted to a table for review), and returns its final
+// text to the parent as a tool result. Expose subagents to the parent by
+// composing a `SubagentExecutor` with `AgentTools` via `CompositeToolExecutor`.
+//
+// This is commented out so the generated controller compiles as-is. To enable,
+// add the imports:
+//     use loco_rs::agui::{
+//         CompositeToolExecutor, LocalSubagent, RigProvider, SubagentExecutor,
+//         SubagentRegistry, AllowAll, EventSink, AguiEvent,
+//     };
+//     use std::sync::Arc;
+//
+// A DB-logging sink for subagent runs (persist each event for debugging/review):
+//
+//     struct DbLoggingSink { db: DatabaseConnection, conversation_id: i32 }
+//     #[async_trait]
+//     impl EventSink for DbLoggingSink {
+//         async fn emit(&self, ev: AguiEvent) -> Result<()> {
+//             // INSERT a row: (conversation_id, event_name, serde_json::to_value(&ev))
+//             let _ = (&self.db, self.conversation_id, ev);
+//             Ok(())
+//         }
+//     }
+//
+// Build the composite executor inside the `run` handler and pass it to
+// `run_turn`/`resume` instead of `AgentTools`:
+//
+//     let api_key = std::env::var("OPENROUTER_API_KEY").unwrap_or_default();
+//     let mut registry = SubagentRegistry::default();
+//     registry.register(LocalSubagent {
+//         name: "summarizer".to_string(),
+//         description: "Summarize the provided text into a few sentences.".to_string(),
+//         system: "You are a concise summarizer.".to_string(),
+//         provider: RigProvider::new(api_key.clone(), None, agent.model.clone()),
+//         exec: AgentTools,      // the subagent's own local tools
+//         authz: AllowAll,       // the subagent's own authorization policy
+//         max_tool_turns: 4,
+//     });
+//     let sink = Arc::new(DbLoggingSink { db: ctx.db.clone(), conversation_id: conversation.id });
+//     let exec = Arc::new(CompositeToolExecutor::default()
+//         .with(AgentTools)
+//         .with(SubagentExecutor::new(Arc::new(registry), sink)));
+//     // ... then `run_turn(&store, exec, &provider, &sink, &params, &authz)`.
+//
+// Two delegation modes:
+//   * Composing `SubagentExecutor` into `exec` (above) runs subagents that
+//     auto-approve their own write tools — simplest, no human-in-the-loop.
+//   * To have a subagent's write tool require *human* approval that bubbles up
+//     to the parent as an interrupt, skip the composite and instead call the
+//     subagent-aware entry points, passing the registry directly:
+//         run_turn_with_subagents(&store, exec, &provider, &sink, &params, &authz, &registry)
+//         resume_with_subagents(&store, exec, &provider, &sink, &params, &authz, &registry, &item)
+//     The suspended child state rides in the parent's pending tool call, so no
+//     extra child-conversation table is required. Attach a review sink with
+//     `SubagentRegistry::default().with_sink(Arc::new(DbLoggingSink { .. }))`.
+
+// ---------------------------------------------------------------------------
 // Conversation store — maps the agent tables to the agui run-loop.
 // ---------------------------------------------------------------------------
 
@@ -514,17 +576,20 @@ pub async fn run(
         thread_id: conversation.pid.to_string(),
         auto_approve: false,
         max_tool_turns: 8,
+        // Optional per-tool-call deadline; each tool runs on its own task.
+        tool_timeout: None,
     };
     let resume_item = input.resume.first().cloned();
 
     let sse = spawn_and_stream(64, || {}, move |sink| async move {
-        let exec = AgentTools;
+        // `Arc`-shared so each tool call can run on (and be timed out on) its own task.
+        let exec = std::sync::Arc::new(AgentTools);
         // Authorize every tool call against the caller's scopes.
         let authz = AppAuthorizer { scopes };
         let result = if let Some(item) = resume_item {
-            resume(&store, &exec, &provider, &sink, &params, &authz, &item).await
+            resume(&store, exec, &provider, &sink, &params, &authz, &item).await
         } else {
-            run_turn(&store, &exec, &provider, &sink, &params, &authz).await
+            run_turn(&store, exec, &provider, &sink, &params, &authz).await
         };
         if let Err(err) = result {
             tracing::error!(error = %err, "agent run failed");

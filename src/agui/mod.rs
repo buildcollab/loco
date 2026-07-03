@@ -54,6 +54,7 @@
 pub mod protocol;
 pub mod provider;
 pub mod runtime;
+pub mod subagent;
 pub mod transport;
 
 // Flat re-exports for ergonomic `use loco_rs::agui::{...}`.
@@ -62,11 +63,16 @@ pub use protocol::{
     RunAgentInput, RunOutcome,
 };
 pub use provider::{
-    AgentDelta, ChatMessage, Provider, RigProvider, StreamAssembler, StubProvider, ToolCallReq,
-    ToolKind, ToolSpec, TurnOutcome, Usage, OPENROUTER_BASE_URL,
+    AgentDelta, ChatMessage, Provider, RigConfig, RigProvider, StreamAssembler, StubProvider,
+    ToolCallReq, ToolKind, ToolSpec, TurnOutcome, Usage, OPENROUTER_BASE_URL,
 };
 pub use runtime::{
-    resume, run_turn, AllowAll, ConversationStore, MessageRef, PendingToolCall, RunParams,
-    ToolAuthorizer, ToolDecision, ToolExecutor, ToolRef,
+    resume, resume_with_subagents, run_turn, run_turn_with_subagents, AllowAll, ConversationStore,
+    MessageRef, PendingToolCall, RunParams, ToolAuthorizer, ToolDecision, ToolExecutor, ToolRef,
+};
+pub use subagent::{
+    default_task_schema, CompositeToolExecutor, InMemoryStore, LocalSubagent, Subagent,
+    SubagentCtx, SubagentExecutor, SubagentOutput, SubagentRegistry, SubagentStep,
+    DEFAULT_MAX_SUBAGENT_DEPTH,
 };
 pub use transport::{event_to_sse, sse_response, spawn_and_stream, EventSink, MpscSink, NullSink};
