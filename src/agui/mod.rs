@@ -90,9 +90,7 @@ pub mod store;
 pub mod worker;
 
 // Flat re-exports for ergonomic `use loco_rs::agui::{...}`.
-pub use agent::{
-    Agent, AgentCtx, AgentHooks, AgentRegistry, NoopHooks, Principal, RunCtx,
-};
+pub use agent::{Agent, AgentCtx, AgentHooks, AgentRegistry, NoopHooks, Principal, RunCtx};
 pub use hub::{
     channel_stream, in_memory, HubEvent, HubEventStream, HubSink, InMemoryRunHub, RunHandle,
     RunHub, DEFAULT_BUFFER_CAP,
@@ -104,10 +102,11 @@ pub use service::{assemble_system, clear_active_run, provider as config_provider
 #[cfg(feature = "with-db")]
 pub use store::DbStore;
 #[cfg(feature = "with-db")]
-pub use worker::{execute, spawn_inline, RunAgentJob, RunArgs};
+pub use worker::{
+    dispatch_run, execute, spawn_inline, start_run, RunAgentJob, RunArgs, StartedRun,
+};
 // Re-exported so generated app code can build cancellation tokens / run hubs
 // without adding `tokio-util` as a direct dependency.
-pub use tokio_util::sync::CancellationToken;
 pub use protocol::{
     part_text, part_tool_result, part_tool_use, AguiEvent, Interrupt, ResumeItem, ResumePayload,
     RunAgentInput, RunOutcome,
@@ -117,7 +116,6 @@ pub use provider::{
     StubProvider, ToolCallReq, ToolKind, ToolSpec, TurnOutcome, Usage, OPENAI_BASE_URL,
     OPENROUTER_BASE_URL,
 };
-pub use tool::{NoArgs, Tool, Tools};
 pub use runtime::{
     resume, resume_with_subagents, run_turn, run_turn_with_subagents, AllowAll, ConversationStore,
     MessageRef, PendingToolCall, RunParams, ToolAuthorizer, ToolDecision, ToolExecutor, ToolRef,
@@ -127,7 +125,9 @@ pub use subagent::{
     SubagentCtx, SubagentExecutor, SubagentOutput, SubagentRegistry, SubagentStep,
     DEFAULT_MAX_SUBAGENT_DEPTH,
 };
+pub use tokio_util::sync::CancellationToken;
+pub use tool::{NoArgs, Tool, Tools};
 pub use transport::{
-    event_to_sse, hub_event_to_sse, hub_sse_response, sse_response, spawn_and_stream, EventSink,
+    event_to_sse, hub_event_to_sse, hub_sse_response, spawn_and_stream, sse_response, EventSink,
     MpscSink, NullSink,
 };
