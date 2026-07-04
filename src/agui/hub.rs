@@ -17,9 +17,10 @@
 //! ## Backends
 //!
 //! - [`InMemoryRunHub`] (here) — a per-process buffer + broadcast. Single node.
-//! - A DB-backed hub for multi-node deploys is generated into the app
-//!   (`src/agents/runtime.rs`) because it uses the app's own event tables /
-//!   entities; it implements this same trait. See the `agui.hub` config.
+//! - [`DbRunHub`] (here, behind `with-db`) — a multi-node backend that persists
+//!   events to `agent_events` and coordinates cancellation via `agent_runs`,
+//!   over the framework-owned [`entities`](super::entities). [`run_hub`] picks
+//!   between them from the `agui.hub` config.
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -325,10 +326,9 @@ impl RunHub for InMemoryRunHub {
     }
 }
 
-/// Wrap an mpsc receiver of [`HubEvent`]s as a [`HubEventStream`]. DB-backed
-/// hubs (generated into the app) poll their event table into a channel and use
-/// this to expose it as a stream — keeping the stream-combinator dependency in
-/// the framework rather than the app.
+/// Wrap an mpsc receiver of [`HubEvent`]s as a [`HubEventStream`]. The DB-backed
+/// [`DbRunHub`] polls its event table into a channel and uses this to expose it
+/// as a stream — keeping the stream-combinator glue in one place.
 #[must_use]
 pub fn channel_stream(rx: tokio::sync::mpsc::Receiver<HubEvent>) -> HubEventStream {
     Box::pin(futures_util::stream::unfold(rx, |mut rx| async move {
@@ -336,14 +336,287 @@ pub fn channel_stream(rx: tokio::sync::mpsc::Receiver<HubEvent>) -> HubEventStre
     }))
 }
 
-/// Build the framework's in-memory hub as a trait object. DB-backed
-/// (multi-node) hubs are constructed in the generated `src/agents/runtime.rs`
-/// from the app's event tables; this helper only covers the framework-owned
-/// single-process backend.
+/// Build the framework's in-memory hub as a trait object. For multi-node
+/// deploys, [`run_hub`] returns a [`DbRunHub`] instead based on `agui.hub`; this
+/// helper only covers the single-process backend.
 #[must_use]
 pub fn in_memory() -> Arc<dyn RunHub> {
     Arc::new(InMemoryRunHub::default())
 }
+
+// ---------------------------------------------------------------------------
+// DB-backed backend (multi-node) + hub selection
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "with-db")]
+mod db {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use sea_orm::{
+        ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel,
+        QueryFilter, QueryOrder, Set,
+    };
+    use serde_json::Value;
+    use tokio_util::sync::CancellationToken;
+    use uuid::Uuid;
+
+    use super::{channel_stream, HubEvent, HubEventStream, RunHandle, RunHub};
+    use crate::agui::entities::{agent_events, agent_runs};
+    use crate::agui::protocol::AguiEvent;
+    use crate::app::AppContext;
+    use crate::config::HubConfig;
+    use crate::Result;
+
+    /// Process-wide run hub, selected once from `agui.hub` config.
+    static HUB: OnceLock<Arc<dyn RunHub>> = OnceLock::new();
+
+    /// The process-wide run hub. In-memory for single-node; DB-backed
+    /// (multi-node) when `agui.hub` is `redis` or `postgres`.
+    ///
+    /// This is the single construction point the framework controller and the
+    /// durable worker both use, so a given process streams and produces through
+    /// the same backend.
+    #[must_use]
+    pub fn run_hub(ctx: &AppContext) -> Arc<dyn RunHub> {
+        HUB.get_or_init(|| {
+            let kind = ctx
+                .config
+                .agui
+                .as_ref()
+                .map(|a| a.hub.clone())
+                .unwrap_or_default();
+            match kind {
+                HubConfig::InMem => super::in_memory(),
+                HubConfig::Redis | HubConfig::Postgres => {
+                    Arc::new(DbRunHub::new(ctx.db.clone()))
+                }
+            }
+        })
+        .clone()
+    }
+
+    /// A multi-node [`RunHub`]: events persist to `agent_events` (replayed on
+    /// resume), and cancellation rides on `agent_runs.cancel_requested` — polled
+    /// by the node that owns the run, which flips its local token. Live tailing
+    /// is by polling the shared tables, so any node can serve a reconnect (and a
+    /// [worker](crate::agui::worker) on one node can drive a run that a web node
+    /// streams).
+    pub struct DbRunHub {
+        db: DatabaseConnection,
+        /// Per-run publish sequence (only the owning node publishes a given run).
+        seqs: Mutex<HashMap<String, i64>>,
+    }
+
+    impl DbRunHub {
+        /// Build a DB-backed hub over `db`.
+        #[must_use]
+        pub fn new(db: DatabaseConnection) -> Self {
+            Self {
+                db,
+                seqs: Mutex::new(HashMap::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RunHub for DbRunHub {
+        async fn start(&self, run_id: &str) -> Result<RunHandle> {
+            let existing = agent_runs::Entity::find()
+                .filter(agent_runs::Column::RunId.eq(run_id))
+                .one(&self.db)
+                .await?;
+            if existing.is_none() {
+                agent_runs::ActiveModel {
+                    pid: Set(Uuid::new_v4()),
+                    run_id: Set(run_id.to_string()),
+                    status: Set("running".to_string()),
+                    cancel_requested: Set(false),
+                    last_seq: Set(0),
+                    ..Default::default()
+                }
+                .insert(&self.db)
+                .await?;
+            }
+            self.seqs
+                .lock()
+                .expect("seqs mutex")
+                .insert(run_id.to_string(), 0);
+
+            // Poll for a cross-node cancel request; flip the local token when seen.
+            let cancel = CancellationToken::new();
+            let poll_token = cancel.clone();
+            let db = self.db.clone();
+            let rid = run_id.to_string();
+            tokio::spawn(async move {
+                loop {
+                    if poll_token.is_cancelled() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1000)).await;
+                    let row = agent_runs::Entity::find()
+                        .filter(agent_runs::Column::RunId.eq(&rid))
+                        .one(&db)
+                        .await
+                        .ok()
+                        .flatten();
+                    match row {
+                        Some(r) if r.cancel_requested => {
+                            poll_token.cancel();
+                            break;
+                        }
+                        // The run finished (possibly on another node). Stop
+                        // polling so a node that only created the row — e.g. a
+                        // web node in worker mode — doesn't leak this task.
+                        Some(r)
+                            if matches!(
+                                r.status.as_str(),
+                                "complete" | "errored" | "cancelled"
+                            ) =>
+                        {
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            });
+
+            Ok(RunHandle {
+                run_id: run_id.to_string(),
+                cancel,
+            })
+        }
+
+        async fn publish(&self, run_id: &str, ev: &AguiEvent) -> Result<()> {
+            let seq = {
+                let mut m = self.seqs.lock().expect("seqs mutex");
+                let e = m.entry(run_id.to_string()).or_insert(0);
+                *e += 1;
+                *e
+            };
+            let he = HubEvent::from_event(seq as u64, ev);
+            agent_events::ActiveModel {
+                pid: Set(Uuid::new_v4()),
+                run_id: Set(run_id.to_string()),
+                seq: Set(seq),
+                name: Set(he.name.clone()),
+                payload: Set(Some(he.data.clone())),
+                ..Default::default()
+            }
+            .insert(&self.db)
+            .await?;
+            if let Some(row) = agent_runs::Entity::find()
+                .filter(agent_runs::Column::RunId.eq(run_id))
+                .one(&self.db)
+                .await?
+            {
+                let mut am = row.into_active_model();
+                am.last_seq = Set(seq);
+                am.update(&self.db).await?;
+            }
+            Ok(())
+        }
+
+        async fn subscribe(&self, run_id: &str, since: u64) -> Result<HubEventStream> {
+            let (tx, rx) = tokio::sync::mpsc::channel::<HubEvent>(256);
+            let db = self.db.clone();
+            let rid = run_id.to_string();
+            tokio::spawn(async move {
+                let mut last = i64::try_from(since).unwrap_or(0);
+                loop {
+                    let events = agent_events::Entity::find()
+                        .filter(agent_events::Column::RunId.eq(&rid))
+                        .filter(agent_events::Column::Seq.gt(last))
+                        .order_by_asc(agent_events::Column::Seq)
+                        .all(&db)
+                        .await
+                        .unwrap_or_default();
+                    for e in events {
+                        last = e.seq;
+                        let he = HubEvent {
+                            seq: e.seq as u64,
+                            name: e.name,
+                            data: e.payload.unwrap_or(Value::Null),
+                        };
+                        if tx.send(he).await.is_err() {
+                            return; // client gone
+                        }
+                    }
+                    let run_row = agent_runs::Entity::find()
+                        .filter(agent_runs::Column::RunId.eq(&rid))
+                        .one(&db)
+                        .await
+                        .ok()
+                        .flatten();
+                    let done = match run_row {
+                        Some(r) => {
+                            matches!(r.status.as_str(), "complete" | "errored" | "cancelled")
+                        }
+                        None => true,
+                    };
+                    if done {
+                        // Final drain to catch events written just before terminal.
+                        let tail = agent_events::Entity::find()
+                            .filter(agent_events::Column::RunId.eq(&rid))
+                            .filter(agent_events::Column::Seq.gt(last))
+                            .order_by_asc(agent_events::Column::Seq)
+                            .all(&db)
+                            .await
+                            .unwrap_or_default();
+                        for e in tail {
+                            let he = HubEvent {
+                                seq: e.seq as u64,
+                                name: e.name,
+                                data: e.payload.unwrap_or(Value::Null),
+                            };
+                            let _ = tx.send(he).await;
+                        }
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            });
+            Ok(channel_stream(rx))
+        }
+
+        async fn cancel(&self, run_id: &str) -> Result<bool> {
+            let Some(row) = agent_runs::Entity::find()
+                .filter(agent_runs::Column::RunId.eq(run_id))
+                .one(&self.db)
+                .await?
+            else {
+                return Ok(false);
+            };
+            let mut am = row.into_active_model();
+            am.cancel_requested = Set(true);
+            am.status = Set("cancelling".to_string());
+            am.update(&self.db).await?;
+            Ok(true)
+        }
+
+        async fn finish(&self, run_id: &str) -> Result<()> {
+            self.seqs.lock().expect("seqs mutex").remove(run_id);
+            if let Some(row) = agent_runs::Entity::find()
+                .filter(agent_runs::Column::RunId.eq(run_id))
+                .one(&self.db)
+                .await?
+            {
+                // Don't overwrite a cancelling/terminal status with "complete".
+                if !matches!(row.status.as_str(), "cancelling" | "cancelled" | "errored") {
+                    let mut am = row.into_active_model();
+                    am.status = Set("complete".to_string());
+                    am.update(&self.db).await?;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(feature = "with-db")]
+pub use db::{run_hub, DbRunHub};
 
 #[cfg(all(test, feature = "agui"))]
 mod tests {

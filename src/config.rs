@@ -477,8 +477,9 @@ fn pgmq_batch_size() -> i32 {
 
 /// AG-UI streaming agent runtime configuration.
 ///
-/// Keeps the LLM provider credentials and the run-hub backend out of code, so
-/// deployments pick them at config time. Mirrors the [`CableConfig`] approach.
+/// Keeps the LLM provider credentials, the run-hub backend, and the execution
+/// mode out of code, so deployments pick them at config time. Mirrors the
+/// [`CableConfig`] approach.
 ///
 /// Example (development):
 /// ```yaml
@@ -490,6 +491,12 @@ fn pgmq_batch_size() -> i32 {
 ///     default_model: anthropic/claude-sonnet-5
 ///   hub:
 ///     kind: in_mem
+///   # execution defaults to inline; for durable, restart-surviving runs use a
+///   # background worker (requires workers.mode: BackgroundQueue + a DB hub):
+///   #   execution:
+///   #     kind: worker
+///   #   hub:
+///   #     kind: postgres
 /// ```
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AguiConfig {
@@ -499,6 +506,31 @@ pub struct AguiConfig {
     /// (single process) when omitted.
     #[serde(default)]
     pub hub: HubConfig,
+    /// How a run is driven: inline in the request process, or handed to a
+    /// durable background worker. Defaults to inline.
+    #[serde(default)]
+    pub execution: ExecutionConfig,
+}
+
+/// How an agent run is executed once started.
+///
+/// - [`ExecutionConfig::Inline`] drives the run on a `tokio::spawn` task inside
+///   the process that received the request. The run survives a dropped client
+///   connection (it publishes to the run hub), but **not** a process restart.
+/// - [`ExecutionConfig::Worker`] enqueues the run on the background-worker queue
+///   ([`crate::bgworker`]); a worker picks it up and drives it, publishing to
+///   the (DB-backed) run hub. The run is then **durable**: it survives a restart
+///   of the web process and can be retried by the queue. Requires
+///   `workers.mode: BackgroundQueue`, a configured queue, and a DB-backed
+///   `hub` so the producing worker and the streaming web node share events.
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExecutionConfig {
+    /// Drive the run on an in-process task. Not durable across restarts.
+    #[default]
+    Inline,
+    /// Enqueue the run as a background-worker job. Durable across restarts.
+    Worker,
 }
 
 /// LLM provider selection for the agent runtime. All variants are

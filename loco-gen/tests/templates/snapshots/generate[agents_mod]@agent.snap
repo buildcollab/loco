@@ -7,9 +7,10 @@ expression: "fs::read_to_string(agents_path.join(\"mod.rs\")).expect(\"agents/mo
 //! Each agent is its own submodule implementing [`loco_rs::agui::Agent`]; the
 //! declared name is the agent id stored on a conversation
 //! (`conversations.agent_id`). Add one with `cargo loco generate agent <name>`.
-
-pub mod runtime;
-pub mod store;
+//!
+//! Persistence, the run hub, provider wiring, the HTTP router, and the durable
+//! worker are all library code in `loco_rs::agui` — this module only declares
+//! agents and builds their [`registry`].
 
 // Per-agent modules (added by the generator):
 // agents-mod-inject (do not remove)

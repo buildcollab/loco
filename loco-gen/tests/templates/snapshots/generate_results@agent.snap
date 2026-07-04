@@ -18,7 +18,8 @@ Next steps:
 Customize this agent's prompt/model here, its tools in `tools.rs`, and its
 lifecycle callbacks in `hooks.rs`.
 
-* Agent controller `agents` was added (thin HTTP layer over `src/agents/`).
+* Agent controller `agents` was added (a one-line mount of the framework router
+`loco_rs::agui::controller::routes`).
 
 Endpoints (all under `/api`):
   GET  agents                                  list declared agents
@@ -34,5 +35,17 @@ Endpoints (all under `/api`):
 Frontend contract: POST `/run` to start and tail; on a dropped connection,
 GET `/stream?since=<lastEventId>` to resume (a fetch abort does NOT cancel the
 run); a Stop button calls POST `/cancel`.
+
+Durability: runs are driven inline by default. Set `agui.execution: { kind:
+worker }` (with `workers.mode: BackgroundQueue` and a DB-backed `agui.hub`) to
+hand each run to a background worker so it survives a process restart. Then
+register the worker in `connect_workers`:
+
+    queue
+        .register(loco_rs::agui::worker::RunAgentJob::with_registry(
+            ctx,
+            std::sync::Arc::new(crate::agents::registry()),
+        ))
+        .await?;
 
 * Agent migration added! Apply it with `$ cargo loco db migrate && cargo loco db entities`.
