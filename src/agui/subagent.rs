@@ -110,8 +110,12 @@ pub trait Subagent: Send + Sync {
     /// # Errors
     /// Provider/store/loop failures propagate as `Err` and are recorded by the
     /// parent as an `error` tool result.
-    async fn run(&self, input: &str, ctx: &SubagentCtx, sink: &dyn EventSink)
-        -> Result<SubagentOutput>;
+    async fn run(
+        &self,
+        input: &str,
+        ctx: &SubagentCtx,
+        sink: &dyn EventSink,
+    ) -> Result<SubagentOutput>;
 
     /// Start the subagent, allowing it to pause for human approval. The default
     /// runs to completion via [`run`](Subagent::run) and never interrupts —
@@ -227,7 +231,15 @@ where
         // `run` auto-approves the subagent's own write tools (never interrupts);
         // use `start`/`resume_step` for the human-approval bubble-up path.
         let params = self.params(ctx, true);
-        run_turn(&store, self.exec.clone(), &self.provider, &sink, &params, &self.authz).await?;
+        run_turn(
+            &store,
+            self.exec.clone(),
+            &self.provider,
+            &sink,
+            &params,
+            &self.authz,
+        )
+        .await?;
         Ok(SubagentOutput {
             text: store.final_text(),
             usage: store.final_usage(),
@@ -244,7 +256,15 @@ where
         // auto_approve = false so the subagent's write tools raise an approval
         // interrupt that bubbles up to the parent.
         let params = self.params(ctx, false);
-        run_turn(&store, self.exec.clone(), &self.provider, &sink, &params, &self.authz).await?;
+        run_turn(
+            &store,
+            self.exec.clone(),
+            &self.provider,
+            &sink,
+            &params,
+            &self.authz,
+        )
+        .await?;
         Ok(self.step_from_store(&store))
     }
 
@@ -264,7 +284,16 @@ where
             interrupt_id: pending.tool_call_id.clone(),
             payload: ResumePayload { approved },
         };
-        resume(&store, self.exec.clone(), &self.provider, &sink, &params, &self.authz, &item).await?;
+        resume(
+            &store,
+            self.exec.clone(),
+            &self.provider,
+            &sink,
+            &params,
+            &self.authz,
+            &item,
+        )
+        .await?;
         Ok(self.step_from_store(&store))
     }
 }
@@ -388,8 +417,18 @@ impl SubagentExecutor {
     /// Build an executor pinned at a specific depth (used when a subagent itself
     /// delegates, to keep the recursion guard accurate).
     #[must_use]
-    pub fn at_depth(registry: Arc<SubagentRegistry>, sink: Arc<dyn EventSink>, depth: usize, max_depth: usize) -> Self {
-        Self { registry, sink, depth, max_depth }
+    pub fn at_depth(
+        registry: Arc<SubagentRegistry>,
+        sink: Arc<dyn EventSink>,
+        depth: usize,
+        max_depth: usize,
+    ) -> Self {
+        Self {
+            registry,
+            sink,
+            depth,
+            max_depth,
+        }
     }
 }
 
@@ -624,7 +663,9 @@ impl ConversationStore for InMemoryStore {
             message_id: msg.id.clone(),
             status: status.to_string(),
         });
-        Ok(ToolRef { id: call.id.clone() })
+        Ok(ToolRef {
+            id: call.id.clone(),
+        })
     }
 
     async fn complete_tool_call(
@@ -705,29 +746,52 @@ mod tests {
     }
 
     fn ctx() -> SubagentCtx {
-        SubagentCtx { depth: 1, max_depth: DEFAULT_MAX_SUBAGENT_DEPTH }
+        SubagentCtx {
+            depth: 1,
+            max_depth: DEFAULT_MAX_SUBAGENT_DEPTH,
+        }
     }
 
     #[tokio::test]
     async fn in_memory_store_captures_final_text() {
         let store = InMemoryStore::with_user("hi");
         let provider = StubProvider::with_reply("hello there");
-        run_turn(&store, Arc::new(EchoTools), &provider, &NullSink, &RunParams {
-            system: "s".into(), run_id: "r".into(), thread_id: "t".into(),
-            auto_approve: true, max_tool_turns: 3, tool_timeout: None,
-            ..Default::default()
-        }, &AllowAll).await.unwrap();
+        run_turn(
+            &store,
+            Arc::new(EchoTools),
+            &provider,
+            &NullSink,
+            &RunParams {
+                system: "s".into(),
+                run_id: "r".into(),
+                thread_id: "t".into(),
+                auto_approve: true,
+                max_tool_turns: 3,
+                tool_timeout: None,
+                ..Default::default()
+            },
+            &AllowAll,
+        )
+        .await
+        .unwrap();
         assert!(store.final_text().contains("hello"));
     }
 
     #[tokio::test]
     async fn local_subagent_runs_and_returns_text() {
         let agent = LocalSubagent {
-            name: "sum".into(), description: "d".into(), system: "s".into(),
+            name: "sum".into(),
+            description: "d".into(),
+            system: "s".into(),
             provider: StubProvider::with_reply("a summary"),
-            exec: Arc::new(EchoTools), authz: AllowAll, max_tool_turns: 3,
+            exec: Arc::new(EchoTools),
+            authz: AllowAll,
+            max_tool_turns: 3,
         };
-        let out = agent.run("please summarize", &ctx(), &NullSink).await.unwrap();
+        let out = agent
+            .run("please summarize", &ctx(), &NullSink)
+            .await
+            .unwrap();
         assert!(out.text.contains("summary"));
     }
 
@@ -735,9 +799,13 @@ mod tests {
     async fn subagent_executor_specs_and_execute() {
         let mut reg = SubagentRegistry::default();
         reg.register(LocalSubagent {
-            name: "sum".into(), description: "Summarize".into(), system: "s".into(),
+            name: "sum".into(),
+            description: "Summarize".into(),
+            system: "s".into(),
             provider: StubProvider::with_reply("done"),
-            exec: Arc::new(EchoTools), authz: AllowAll, max_tool_turns: 2,
+            exec: Arc::new(EchoTools),
+            authz: AllowAll,
+            max_tool_turns: 2,
         });
         let exec = SubagentExecutor::new(Arc::new(reg), null_sink());
 
@@ -746,7 +814,10 @@ mod tests {
         assert_eq!(specs[0].name, "sum");
         assert_eq!(specs[0].kind, ToolKind::Read);
 
-        let res = exec.execute("sum", json!({ "input": "text" })).await.unwrap();
+        let res = exec
+            .execute("sum", json!({ "input": "text" }))
+            .await
+            .unwrap();
         assert!(res["output"].as_str().unwrap().contains("done"));
     }
 
@@ -761,8 +832,13 @@ mod tests {
     async fn depth_guard_errors() {
         let mut reg = SubagentRegistry::default();
         reg.register(LocalSubagent {
-            name: "sum".into(), description: "d".into(), system: "s".into(),
-            provider: StubProvider::new(), exec: Arc::new(EchoTools), authz: AllowAll, max_tool_turns: 2,
+            name: "sum".into(),
+            description: "d".into(),
+            system: "s".into(),
+            provider: StubProvider::new(),
+            exec: Arc::new(EchoTools),
+            authz: AllowAll,
+            max_tool_turns: 2,
         });
         // Pin depth == max so any delegation trips the guard.
         let exec = SubagentExecutor::at_depth(Arc::new(reg), null_sink(), 3, 3);
@@ -773,9 +849,13 @@ mod tests {
     async fn composite_routes_by_name() {
         let mut reg = SubagentRegistry::default();
         reg.register(LocalSubagent {
-            name: "sum".into(), description: "d".into(), system: "s".into(),
+            name: "sum".into(),
+            description: "d".into(),
+            system: "s".into(),
             provider: StubProvider::with_reply("sub result"),
-            exec: Arc::new(EchoTools), authz: AllowAll, max_tool_turns: 2,
+            exec: Arc::new(EchoTools),
+            authz: AllowAll,
+            max_tool_turns: 2,
         });
         let composite = CompositeToolExecutor::default()
             .with(EchoTools)
@@ -787,23 +867,36 @@ mod tests {
         assert!(names.contains(&"sum".to_string()));
 
         // Routes to the app tool.
-        assert_eq!(composite.execute("noop", json!({})).await.unwrap()["ok"], "noop");
+        assert_eq!(
+            composite.execute("noop", json!({})).await.unwrap()["ok"],
+            "noop"
+        );
         // Routes to the subagent.
-        assert!(composite.execute("sum", json!({"input":"x"})).await.unwrap()["output"]
-            .as_str().unwrap().contains("sub result"));
+        assert!(composite
+            .execute("sum", json!({"input":"x"}))
+            .await
+            .unwrap()["output"]
+            .as_str()
+            .unwrap()
+            .contains("sub result"));
     }
 
     // Boxed/erased components still satisfy `Subagent` (dyn-compat guard).
     #[tokio::test]
     async fn boxed_components_compile_and_run() {
-        let agent: LocalSubagent<Box<dyn Provider>, Box<dyn ToolExecutor>, Box<dyn ToolAuthorizer>> =
-            LocalSubagent {
-                name: "b".into(), description: "d".into(), system: "s".into(),
-                provider: Box::new(StubProvider::with_reply("boxed ok")),
-                exec: Arc::new(Box::new(EchoTools) as Box<dyn ToolExecutor>),
-                authz: Box::new(AllowAll),
-                max_tool_turns: 2,
-            };
+        let agent: LocalSubagent<
+            Box<dyn Provider>,
+            Box<dyn ToolExecutor>,
+            Box<dyn ToolAuthorizer>,
+        > = LocalSubagent {
+            name: "b".into(),
+            description: "d".into(),
+            system: "s".into(),
+            provider: Box::new(StubProvider::with_reply("boxed ok")),
+            exec: Arc::new(Box::new(EchoTools) as Box<dyn ToolExecutor>),
+            authz: Box::new(AllowAll),
+            max_tool_turns: 2,
+        };
         let out = agent.run("go", &ctx(), &NullSink).await.unwrap();
         assert!(out.text.contains("boxed ok"));
     }
@@ -825,9 +918,13 @@ mod tests {
         let sink: Arc<dyn EventSink> = collector.clone();
         let mut reg = SubagentRegistry::default();
         reg.register(LocalSubagent {
-            name: "sum".into(), description: "d".into(), system: "s".into(),
+            name: "sum".into(),
+            description: "d".into(),
+            system: "s".into(),
             provider: StubProvider::with_reply("logged"),
-            exec: Arc::new(EchoTools), authz: AllowAll, max_tool_turns: 2,
+            exec: Arc::new(EchoTools),
+            authz: AllowAll,
+            max_tool_turns: 2,
         });
         let exec = SubagentExecutor::new(Arc::new(reg), sink);
         exec.execute("sum", json!({"input":"x"})).await.unwrap();

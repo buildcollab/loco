@@ -71,7 +71,10 @@ impl PgMqPubSub {
 
     fn make_queue_name() -> String {
         // pgmq queue names are limited; ulid base32 is short and safe.
-        format!("loco_cable_{}", ulid::Ulid::new().to_string().to_lowercase())
+        format!(
+            "loco_cable_{}",
+            ulid::Ulid::new().to_string().to_lowercase()
+        )
     }
 }
 
@@ -104,10 +107,7 @@ impl PubSub for PgMqPubSub {
 
     async fn subscribe(&self, topic: &str) -> Result<Subscription> {
         let queue_name = Self::make_queue_name();
-        self.queue
-            .create(&queue_name)
-            .await
-            .map_err(Error::wrap)?;
+        self.queue.create(&queue_name).await.map_err(Error::wrap)?;
         sqlx::query("INSERT INTO loco_cable_pgmq_subs (queue_name, topic) VALUES ($1, $2)")
             .bind(&queue_name)
             .bind(topic)
@@ -237,8 +237,7 @@ pub async fn create_provider(cfg: &PgMQCableConfig) -> Result<Arc<dyn PubSub>> {
 /// Tiny base64 encode/decode helpers — kept inline to avoid pulling in a
 /// dedicated base64 crate. URL-safe alphabet, no padding.
 fn b64(data: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity((data.len() * 4 + 2) / 3);
     for chunk in data.chunks(3) {
         let b0 = chunk[0];

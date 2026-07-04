@@ -191,12 +191,11 @@ impl PubSub for PgPubSub {
     }
 
     async fn subscribe(&self, topic: &str) -> Result<Subscription> {
-        let max_id: Option<i64> = sqlx::query_scalar(
-            "SELECT MAX(id) FROM loco_cable_messages WHERE topic = $1",
-        )
-        .bind(topic)
-        .fetch_one(&self.pool)
-        .await?;
+        let max_id: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(id) FROM loco_cable_messages WHERE topic = $1")
+                .bind(topic)
+                .fetch_one(&self.pool)
+                .await?;
         let max_id = max_id.unwrap_or(0);
 
         let last_seen = Arc::new(AtomicI64::new(max_id));

@@ -21,7 +21,7 @@ on:
   pull_request:
 
 env:
-  RUST_TOOLCHAIN: stable
+  RUST_TOOLCHAIN: "1.95.0"
   TOOLCHAIN_PROFILE: minimal
 
 jobs:

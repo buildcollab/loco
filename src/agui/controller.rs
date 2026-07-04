@@ -42,13 +42,9 @@ use super::agent::{AgentRegistry, Principal};
 use super::entities::{context_items, conversations, messages};
 use super::hub::run_hub;
 use super::protocol::RunAgentInput;
-use super::runtime::ConversationStore;
-use super::store::DbStore;
 use super::transport::hub_sse_response;
-use super::worker::{spawn_inline, RunAgentJob, RunArgs};
+use super::worker::{dispatch_run, RunArgs};
 use crate::app::AppContext;
-use crate::bgworker::BackgroundWorker;
-use crate::config::ExecutionConfig;
 use crate::controller::{format, Json, Routes};
 use crate::{Error, Result};
 
@@ -109,7 +105,10 @@ async fn list_agents(Extension(registry): Registry) -> Result<Response> {
     format::json(agents)
 }
 
-async fn get_agent(Path(agent_id): Path<String>, Extension(registry): Registry) -> Result<Response> {
+async fn get_agent(
+    Path(agent_id): Path<String>,
+    Extension(registry): Registry,
+) -> Result<Response> {
     let agent = registry.get(&agent_id).ok_or(Error::NotFound)?;
     format::json(json!({
         "name": agent.name(),
@@ -186,8 +185,8 @@ async fn add_context(
 /// client resumes via `GET /stream`. This response tails the run from seq 0.
 ///
 /// Execution is inline (`tokio::spawn`) or handed to a durable background worker
-/// depending on `agui.execution`; either way this handler starts the run in the
-/// hub, records the active run, persists the user message, then subscribes.
+/// depending on `agui.execution` — [`dispatch_run`] handles both; this handler
+/// only resolves the conversation and then subscribes.
 async fn run(
     Path(conversation_pid): Path<String>,
     State(ctx): State<AppContext>,
@@ -201,59 +200,19 @@ async fn run(
         return Err(Error::NotFound);
     }
 
-    let store = DbStore::new(ctx.db.clone(), conversation.id);
-    // Persist the incoming user message for a fresh turn (resumes carry none).
-    if input.resume.is_empty() {
-        if let Some(text) = &input.message {
-            store.append_user_message(text).await?;
-        }
-    }
-
     let run_id = input
         .run_id
         .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
-    let hub = run_hub(&ctx);
-    let handle = hub.start(&run_id).await?;
-    super::service::set_active_run(&ctx.db, conversation.id, Some(&run_id)).await?;
-
     let args = RunArgs {
         conversation_pid: conversation.pid.to_string(),
         run_id: run_id.clone(),
         input,
         principal: principal.0,
     };
+    dispatch_run(&ctx, &registry, conversation.id, args).await?;
 
-    let execution = ctx
-        .config
-        .agui
-        .as_ref()
-        .map(|a| a.execution.clone())
-        .unwrap_or_default();
-    match execution {
-        ExecutionConfig::Inline => {
-            spawn_inline(ctx.clone(), registry, args, handle.cancel);
-        }
-        // Durable: enqueue so the run outlives this process; a worker calls
-        // `hub.start` again (idempotent) for its own cancel token. Worker
-        // execution only makes sense with a real queue — if the app is not in
-        // `BackgroundQueue` mode, `perform_later` would run the job with an
-        // empty registry, so fall back to inline instead of failing the run.
-        ExecutionConfig::Worker
-            if ctx.config.workers.mode == crate::config::WorkerMode::BackgroundQueue =>
-        {
-            RunAgentJob::perform_later(&ctx, args).await?;
-        }
-        ExecutionConfig::Worker => {
-            tracing::warn!(
-                target: "loco_rs::agui",
-                "agui.execution=worker requires workers.mode=BackgroundQueue; running inline"
-            );
-            spawn_inline(ctx.clone(), registry, args, handle.cancel);
-        }
-    }
-
-    let stream = hub.subscribe(&run_id, 0).await?;
+    let stream = run_hub(&ctx).subscribe(&run_id, 0).await?;
     Ok(hub_sse_response(stream).into_response())
 }
 
@@ -296,8 +255,14 @@ pub fn routes(registry: Arc<AgentRegistry>) -> Routes {
         .add("agents/{agent_id}", get(get_agent))
         .add("agents/{agent_id}/conversations", get(list_conversations))
         .add("agents/{agent_id}/conversations", post(create_conversation))
-        .add("conversations/{conversation_pid}/messages", get(list_messages))
-        .add("conversations/{conversation_pid}/context", post(add_context))
+        .add(
+            "conversations/{conversation_pid}/messages",
+            get(list_messages),
+        )
+        .add(
+            "conversations/{conversation_pid}/context",
+            post(add_context),
+        )
         .add("conversations/{conversation_pid}/run", post(run))
         .add("conversations/{conversation_pid}/stream", get(stream))
         .add("conversations/{conversation_pid}/cancel", post(cancel))

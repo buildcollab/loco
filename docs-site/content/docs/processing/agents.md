@@ -247,6 +247,55 @@ nodes through the shared `agent_events` / `agent_runs` tables.
 | Requires a queue                  | ❌                 | ✅ (`BackgroundQueue`)       |
 | Requires a DB-backed hub          | ❌                 | ✅ (`redis` / `postgres`)    |
 
+## Headless runs (no client attached)
+
+A run does not need an HTTP request or a browser watching the stream. To kick
+off an agent from a **task**, the **scheduler**, or another **worker** — e.g. to
+generate a report asynchronously — call `start_run`:
+
+```rust
+use loco_rs::agui::{start_run, Principal};
+
+let run = start_run(
+    &ctx,
+    &std::sync::Arc::new(crate::agents::registry()),
+    "report_writer",                       // agent id
+    "Generate the Q3 sales report",        // the trigger prompt
+    Principal::default(),                  // no request principal in the background
+).await?;
+```
+
+`start_run` opens a fresh conversation for the agent, seeds the prompt, and
+dispatches the run — **durably onto the worker queue when `agui.execution=worker`,
+otherwise inline**. It returns the conversation and run ids so you can read the
+result afterward:
+
+```rust
+// later — the agent's reply is the final assistant message
+let messages = messages::Entity::find()
+    .filter(messages::Column::ConversationId.eq(run.conversation_id))
+    .all(&ctx.db).await?;
+```
+
+Two idiomatic ways to consume the result:
+
+- **Read the reply** from `messages` once the run finishes (poll, or subscribe
+  to the run's stream with the returned `run_id`).
+- **Let a tool be the deliverable** — give `report_writer` a `save_report` tool
+  that writes to storage / the DB / email. The artifact is then the side effect
+  and you never have to read messages back. This is usually the better fit for
+  report generation.
+
+Pair `start_run` with the [scheduler](@/docs/processing/scheduler.md) for
+recurring work (a nightly digest, a weekly report). For durability the same
+requirements apply as any worker run: `workers.mode: BackgroundQueue` and a
+DB-backed `agui.hub`.
+
+> **Note:** the trigger message is persisted by the shared executor when the run
+> actually starts — so with `execution=worker` the user message appears once a
+> worker picks the job up, not at enqueue time. The HTTP `POST /run` endpoint
+> and `start_run` behave identically here.
+
 ## Tools, hooks & authorization
 
 - **Tools** (`src/agents/<name>/tools.rs`) are typed: each declares a `ToolSpec`

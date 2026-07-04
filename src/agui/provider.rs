@@ -161,10 +161,7 @@ pub fn history_from_parts(
                         .get("toolCallId")
                         .and_then(Value::as_str)
                         .unwrap_or_default();
-                    let name = part
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
+                    let name = part.get("name").and_then(Value::as_str).unwrap_or_default();
                     let arguments = part.get("input").cloned().unwrap_or_else(|| json!({}));
                     tool_calls.push(ToolCallReq {
                         id: id.to_string(),
@@ -179,7 +176,10 @@ pub fn history_from_parts(
                         .unwrap_or_default();
                     let content = part.get("content").map_or_else(
                         || String::new(),
-                        |c| c.as_str().map_or_else(|| c.to_string(), ToString::to_string),
+                        |c| {
+                            c.as_str()
+                                .map_or_else(|| c.to_string(), ToString::to_string)
+                        },
                     );
                     tool_results.push(ChatMessage::tool_result(id, &content));
                 }
@@ -672,11 +672,7 @@ impl RigProvider {
 
     /// Set OpenRouter attribution headers (builder style).
     #[must_use]
-    pub fn with_headers(
-        mut self,
-        referer: impl Into<String>,
-        title: impl Into<String>,
-    ) -> Self {
+    pub fn with_headers(mut self, referer: impl Into<String>, title: impl Into<String>) -> Self {
         self.config.referer = Some(referer.into());
         self.config.title = Some(title.into());
         self
@@ -1089,7 +1085,11 @@ impl StubProvider {
 
 enum Plan {
     Text(String),
-    Tool { id: String, name: String, args: Value },
+    Tool {
+        id: String,
+        name: String,
+        args: Value,
+    },
 }
 
 #[async_trait::async_trait]
@@ -1205,10 +1205,7 @@ fn chunk_words(text: &str, n: usize) -> Vec<String> {
     if words.is_empty() {
         return vec![text.to_string()];
     }
-    words
-        .chunks(n.max(1))
-        .map(|c| c.join(" "))
-        .collect()
+    words.chunks(n.max(1)).map(|c| c.join(" ")).collect()
 }
 
 #[cfg(all(test, feature = "agui"))]
@@ -1295,9 +1292,7 @@ mod tests {
         let (deltas, outcome) = collect(&stub, &history, &[]).await;
 
         assert!(matches!(deltas.first(), Some(AgentDelta::TextDelta(_))));
-        assert!(deltas
-            .iter()
-            .any(|d| matches!(d, AgentDelta::Usage(_))));
+        assert!(deltas.iter().any(|d| matches!(d, AgentDelta::Usage(_))));
         assert!(matches!(deltas.last(), Some(AgentDelta::Done { .. })));
         match outcome {
             TurnOutcome::Final { text, .. } => assert!(text.contains("one")),
@@ -1343,7 +1338,9 @@ mod tests {
         // Tool path
         let tool_hist = vec![ChatMessage::text("user", "update the record")];
         assert!(matches!(
-            stub.run_turn("", &tool_hist, &[write_spec()]).await.unwrap(),
+            stub.run_turn("", &tool_hist, &[write_spec()])
+                .await
+                .unwrap(),
             TurnOutcome::Tools { .. }
         ));
     }
@@ -1595,7 +1592,10 @@ mod tests {
         assert_eq!(b1["temperature"], json!(0.2));
         assert_eq!(b1["max_tokens"], json!(256));
         assert_eq!(b1["top_p"], json!(0.9));
-        assert_eq!(b1["messages"][0]["content"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            b1["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
     }
 
     #[test]

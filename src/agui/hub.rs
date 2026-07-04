@@ -390,9 +390,7 @@ mod db {
                 .unwrap_or_default();
             match kind {
                 HubConfig::InMem => super::in_memory(),
-                HubConfig::Redis | HubConfig::Postgres => {
-                    Arc::new(DbRunHub::new(ctx.db.clone()))
-                }
+                HubConfig::Redis | HubConfig::Postgres => Arc::new(DbRunHub::new(ctx.db.clone())),
             }
         })
         .clone()

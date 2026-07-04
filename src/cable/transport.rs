@@ -93,8 +93,7 @@ async fn run_ws<C: Channel>(
         .ok_or_else(|| Error::string("cable provider not configured"))?;
 
     let topics: Vec<String> = {
-        let params_typed: C::Params =
-            serde_json::from_value(params).map_err(Error::JSON)?;
+        let params_typed: C::Params = serde_json::from_value(params).map_err(Error::JSON)?;
         channel.subscribed(&ctx, params_typed).await?
     };
 

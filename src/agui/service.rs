@@ -6,7 +6,10 @@
 //! These are **library** helpers so an app only writes agent-specific prompts,
 //! not the plumbing that feeds them.
 
-use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel, QueryFilter, Set};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel, QueryFilter,
+    Set,
+};
 use uuid::Uuid;
 
 use super::agent::AgentCtx;

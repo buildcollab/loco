@@ -66,7 +66,8 @@ fn can_generate() {
     // library code in `loco_rs::agui` (store / hub / service / controller).
     assert_snapshot!(
         "generate[agent_dir_mod]",
-        fs::read_to_string(agents_path.join("support").join("mod.rs")).expect("support/mod.rs missing")
+        fs::read_to_string(agents_path.join("support").join("mod.rs"))
+            .expect("support/mod.rs missing")
     );
     assert_snapshot!(
         "generate[agent_dir_tools]",
@@ -93,10 +94,12 @@ fn can_generate() {
     // INJECTIONS into lib.rs (module decl + agent registration)
     assert_snapshot!(
         "inject[lib_rs]",
-        fs::read_to_string(tree_fs.root.join("src").join("lib.rs")).expect("lib.rs injection failed")
+        fs::read_to_string(tree_fs.root.join("src").join("lib.rs"))
+            .expect("lib.rs injection failed")
     );
     assert_snapshot!(
         "inject[app_rs]",
-        fs::read_to_string(tree_fs.root.join("src").join("app.rs")).expect("app.rs injection failed")
+        fs::read_to_string(tree_fs.root.join("src").join("app.rs"))
+            .expect("app.rs injection failed")
     );
 }

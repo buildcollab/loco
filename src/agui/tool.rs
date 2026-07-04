@@ -237,7 +237,9 @@ mod tests {
         let tools = Tools::new().with(EchoTool);
         // Missing required `text` → deserialize error, surfaced (not a panic).
         let err = tools.execute("echo", json!({})).await.unwrap_err();
-        assert!(err.to_string().contains("invalid arguments for tool 'echo'"));
+        assert!(err
+            .to_string()
+            .contains("invalid arguments for tool 'echo'"));
     }
 
     #[tokio::test]

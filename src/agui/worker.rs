@@ -37,7 +37,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -45,11 +45,13 @@ use uuid::Uuid;
 use super::agent::{AgentCtx, AgentRegistry, Principal};
 use super::entities::conversations;
 use super::hub::{run_hub, HubSink};
-use super::runtime::{resume, run_turn, RunParams};
+use super::protocol::RunAgentInput;
+use super::runtime::{resume, run_turn, ConversationStore, RunParams};
 use super::service;
 use super::store::DbStore;
 use crate::app::AppContext;
 use crate::bgworker::BackgroundWorker;
+use crate::config::{ExecutionConfig, WorkerMode};
 use crate::{Error, Result};
 
 /// The serializable payload identifying a run — the durable job body, and the
@@ -62,38 +64,58 @@ pub struct RunArgs {
     /// The run id (the hub key; the SSE stream's identity).
     pub run_id: String,
     /// The AG-UI input (a fresh message and/or resume instructions).
-    pub input: super::protocol::RunAgentInput,
+    pub input: RunAgentInput,
     /// The authenticated principal, captured request-side (there is no request
     /// in a worker), so prompt assembly and authorization behave the same.
     pub principal: Principal,
 }
 
-/// Drive a run to completion: resolve the agent from `registry`, build its
-/// context / prompt / tools / store, then run the loop publishing to the run
-/// hub. Finalizes by finishing the hub and clearing the conversation's active
-/// run. Shared by [`spawn_inline`] and [`RunAgentJob`].
+/// Persist the triggering user message for a fresh turn. A resume (which carries
+/// no new message, only approve/deny answers) seeds nothing. Kept in the shared
+/// executor so the HTTP and headless paths seed identically — callers hand the
+/// message on [`RunArgs::input`] and never touch the store themselves.
+async fn seed_turn(store: &DbStore, input: &RunAgentInput) -> Result<()> {
+    if input.resume.is_empty() {
+        if let Some(text) = &input.message {
+            store.append_user_message(text).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Drive a run to completion: resolve the agent from `registry`, seed the
+/// triggering message, build its context / prompt / tools / store, then run the
+/// loop publishing to the run hub. Finalizes by finishing the hub and clearing
+/// the conversation's active run. Shared by [`spawn_inline`] and [`RunAgentJob`].
 ///
-/// The user message (for a fresh turn) and the conversation's `active_run_id`
-/// are expected to already be persisted by the caller before dispatch, so a
-/// client that reconnects to `GET .../stream` sees the run immediately.
+/// The conversation's `active_run_id` is expected to already be set by the
+/// caller ([`dispatch_run`]) before dispatch, so a client that reconnects to
+/// `GET .../stream` sees the run immediately. The user message, by contrast, is
+/// seeded here so it lands whether the run is inline or picked up by a worker.
 ///
 /// # Errors
-/// Propagates a failure to resolve the conversation/agent or to build the
-/// system prompt. A failure inside the run loop is logged and returned after
-/// the hub is finished.
+/// Propagates a failure to resolve the conversation/agent, seed the message, or
+/// build the system prompt. A failure inside the run loop is logged and returned
+/// after the hub is finished.
 pub async fn execute(
     ctx: &AppContext,
     registry: &AgentRegistry,
     args: &RunArgs,
     cancel: CancellationToken,
 ) -> Result<()> {
-    let uuid = Uuid::parse_str(&args.conversation_pid).map_err(|e| Error::Message(e.to_string()))?;
+    let uuid =
+        Uuid::parse_str(&args.conversation_pid).map_err(|e| Error::Message(e.to_string()))?;
     let conversation = conversations::Entity::find()
         .filter(conversations::Column::Pid.eq(uuid))
         .one(&ctx.db)
         .await?
         .ok_or(Error::NotFound)?;
-    let agent = registry.get(&conversation.agent_id).ok_or(Error::NotFound)?;
+    let agent = registry
+        .get(&conversation.agent_id)
+        .ok_or(Error::NotFound)?;
+
+    let store = DbStore::new(ctx.db.clone(), conversation.id);
+    seed_turn(&store, &args.input).await?;
 
     let actx = AgentCtx {
         app: ctx,
@@ -105,7 +127,6 @@ pub async fn execute(
     let authz = agent.authorizer(&actx);
     let hooks = agent.hooks();
     let tools = Arc::new(agent.tools());
-    let store = DbStore::new(ctx.db.clone(), conversation.id);
     let provider = service::provider(ctx, &agent.model());
 
     let params = RunParams {
@@ -146,6 +167,131 @@ pub fn spawn_inline(
     tokio::spawn(async move {
         let _ = execute(&ctx, &registry, &args, cancel).await;
     });
+}
+
+/// Start a run on an existing conversation: register it in the hub, mark it as
+/// the conversation's active run, then drive it — durably onto the background
+/// queue when `agui.execution=worker` (and a `BackgroundQueue` is configured),
+/// otherwise inline. Shared by the HTTP controller and [`start_run`].
+///
+/// The triggering message is not persisted here — [`execute`] seeds it — so the
+/// same call works whether the run is picked up now (inline) or later (worker).
+///
+/// # Errors
+/// Propagates hub / DB errors, or an enqueue failure in worker mode.
+pub async fn dispatch_run(
+    ctx: &AppContext,
+    registry: &Arc<AgentRegistry>,
+    conversation_id: i32,
+    args: RunArgs,
+) -> Result<()> {
+    let hub = run_hub(ctx);
+    let handle = hub.start(&args.run_id).await?;
+    service::set_active_run(&ctx.db, conversation_id, Some(&args.run_id)).await?;
+
+    let execution = ctx
+        .config
+        .agui
+        .as_ref()
+        .map(|a| a.execution.clone())
+        .unwrap_or_default();
+    match execution {
+        ExecutionConfig::Inline => {
+            spawn_inline(ctx.clone(), registry.clone(), args, handle.cancel);
+        }
+        // Durable: enqueue so the run outlives this process. Worker execution
+        // only makes sense with a real queue — if the app is not in
+        // `BackgroundQueue` mode, `perform_later` would run the job with an
+        // empty registry, so fall back to inline instead of failing the run.
+        ExecutionConfig::Worker if ctx.config.workers.mode == WorkerMode::BackgroundQueue => {
+            RunAgentJob::perform_later(ctx, args).await?;
+        }
+        ExecutionConfig::Worker => {
+            tracing::warn!(
+                target: "loco_rs::agui",
+                "agui.execution=worker requires workers.mode=BackgroundQueue; running inline"
+            );
+            spawn_inline(ctx.clone(), registry.clone(), args, handle.cancel);
+        }
+    }
+    Ok(())
+}
+
+/// A headless run that was started: the new conversation's public id and the run
+/// id, so a caller can later read the result from `messages` or attach to the
+/// stream (`GET .../stream`).
+#[derive(Debug, Clone)]
+pub struct StartedRun {
+    /// Public id (`pid`) of the conversation opened for the run.
+    pub conversation_pid: String,
+    /// The run id.
+    pub run_id: String,
+    /// Numeric id of the opened conversation.
+    pub conversation_id: i32,
+}
+
+/// Start an agent run with **no HTTP request and no client attached** — from a
+/// task, the scheduler, or another worker (generate a report, run a nightly
+/// digest, ...).
+///
+/// Opens a fresh conversation for `agent_id`, hands it `message`, and dispatches
+/// the run: durably onto the background-worker queue when `agui.execution=worker`
+/// (see [`dispatch_run`]), otherwise inline. Returns the ids so the caller can
+/// read the assistant's reply from `messages` afterward — or, more usefully for
+/// a report, have the agent's tool write the artifact and treat that as the
+/// deliverable.
+///
+/// ```rust,ignore
+/// let run = loco_rs::agui::start_run(
+///     &ctx,
+///     &std::sync::Arc::new(crate::agents::registry()),
+///     "report_writer",
+///     "Generate the Q3 sales report",
+///     Principal::default(),
+/// ).await?;
+/// // later: read `messages` for conversation `run.conversation_pid`
+/// ```
+///
+/// # Errors
+/// Returns [`Error::NotFound`] if `agent_id` is not in the registry; otherwise
+/// propagates DB / hub / enqueue errors.
+pub async fn start_run(
+    ctx: &AppContext,
+    registry: &Arc<AgentRegistry>,
+    agent_id: &str,
+    message: impl Into<String>,
+    principal: Principal,
+) -> Result<StartedRun> {
+    if registry.get(agent_id).is_none() {
+        return Err(Error::NotFound);
+    }
+    let pid = Uuid::new_v4();
+    let conversation = conversations::ActiveModel {
+        pid: Set(pid),
+        agent_id: Set(agent_id.to_string()),
+        status: Set(Some("idle".to_string())),
+        ..Default::default()
+    }
+    .insert(&ctx.db)
+    .await?;
+
+    let run_id = Uuid::new_v4().to_string();
+    let args = RunArgs {
+        conversation_pid: pid.to_string(),
+        run_id: run_id.clone(),
+        input: RunAgentInput {
+            run_id: None,
+            message: Some(message.into()),
+            resume: Vec::new(),
+        },
+        principal,
+    };
+    dispatch_run(ctx, registry, conversation.id, args).await?;
+    Ok(StartedRun {
+        conversation_pid: pid.to_string(),
+        run_id,
+        conversation_id: conversation.id,
+    })
 }
 
 /// The durable run job. Register one instance per process via
@@ -190,5 +336,92 @@ impl BackgroundWorker<RunArgs> for RunAgentJob {
         // row already exists — the web node created it before enqueuing).
         let handle = run_hub(&self.ctx).start(&args.run_id).await?;
         execute(&self.ctx, &self.registry, &args, handle.cancel).await
+    }
+}
+
+#[cfg(all(test, feature = "agui", feature = "with-db"))]
+mod tests {
+    use sea_orm::{EntityTrait, PaginatorTrait};
+    use sea_orm_migration::SchemaManager;
+
+    use super::{seed_turn, DbStore, RunAgentInput};
+    use crate::agui::entities::messages;
+    use crate::agui::protocol::{ResumeItem, ResumePayload};
+    use crate::schema::{create_table, ColType};
+
+    // Create just the `messages` table (SQLite does not enforce the FK, so the
+    // conversation row is unnecessary) so we can exercise `seed_turn` in
+    // isolation, with no provider / network.
+    async fn store_with_messages_table() -> DbStore {
+        let ctx = crate::tests_cfg::app::get_app_context().await;
+        let m = SchemaManager::new(&ctx.db);
+        create_table(
+            &m,
+            "messages",
+            &[
+                ("id", ColType::PkAuto),
+                ("pid", ColType::UuidUniq),
+                ("conversation_id", ColType::IntegerNull),
+                ("role", ColType::String),
+                ("content", ColType::TextNull),
+                ("parts", ColType::JsonBinaryNull),
+                ("provider", ColType::StringNull),
+                ("model", ColType::StringNull),
+                ("usage", ColType::JsonBinaryNull),
+                ("status", ColType::StringNull),
+            ],
+            &[],
+        )
+        .await
+        .expect("create messages table");
+        DbStore::new(ctx.db, 1)
+    }
+
+    fn fresh(message: &str) -> RunAgentInput {
+        RunAgentInput {
+            run_id: None,
+            message: Some(message.to_string()),
+            resume: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn seeds_user_message_on_fresh_turn() {
+        let store = store_with_messages_table().await;
+        seed_turn(&store, &fresh("Generate the Q3 report"))
+            .await
+            .unwrap();
+
+        let rows = messages::Entity::find().all(&store.db).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].role, "user");
+        assert_eq!(rows[0].content.as_deref(), Some("Generate the Q3 report"));
+    }
+
+    #[tokio::test]
+    async fn does_not_seed_on_resume() {
+        let store = store_with_messages_table().await;
+        let resume = RunAgentInput {
+            run_id: None,
+            message: None,
+            resume: vec![ResumeItem {
+                interrupt_id: "i1".to_string(),
+                payload: ResumePayload { approved: true },
+            }],
+        };
+        seed_turn(&store, &resume).await.unwrap();
+        assert_eq!(messages::Entity::find().count(&store.db).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn does_not_seed_empty_message() {
+        let store = store_with_messages_table().await;
+        let empty = RunAgentInput {
+            run_id: None,
+            message: None,
+            resume: Vec::new(),
+        };
+        seed_turn(&store, &empty).await.unwrap();
+        assert_eq!(messages::Entity::find().count(&store.db).await.unwrap(), 0);
     }
 }
