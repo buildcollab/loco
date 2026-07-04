@@ -55,11 +55,7 @@ impl PubSub for RedisPubSub {
     async fn subscribe(&self, topic: &str) -> Result<Subscription> {
         // Each subscription gets its own dedicated connection — Redis
         // requires this.
-        let pubsub_conn = self
-            .client
-            .get_async_pubsub()
-            .await
-            .map_err(Error::wrap)?;
+        let pubsub_conn = self.client.get_async_pubsub().await.map_err(Error::wrap)?;
         let cancel = CancellationToken::new();
         let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
         let topic_owned = topic.to_string();

@@ -121,11 +121,7 @@ pub trait StoreDriver: Sync + Send {
     /// Returns [`StorageError::NotSupported`] for backends without a
     /// URL concept (in-memory, null) and propagates underlying signing
     /// errors otherwise.
-    async fn presign_read(
-        &self,
-        _path: &Path,
-        _expire: Duration,
-    ) -> StorageResult<String> {
+    async fn presign_read(&self, _path: &Path, _expire: Duration) -> StorageResult<String> {
         Err(super::StorageError::NotSupported)
     }
 
@@ -139,11 +135,7 @@ pub trait StoreDriver: Sync + Send {
     /// Returns [`StorageError::NotSupported`] for backends without
     /// presigned-PUT support (local fs, in-memory, null) and propagates
     /// underlying signing errors otherwise.
-    async fn presign_write(
-        &self,
-        _path: &Path,
-        _expire: Duration,
-    ) -> StorageResult<String> {
+    async fn presign_write(&self, _path: &Path, _expire: Duration) -> StorageResult<String> {
         Err(super::StorageError::NotSupported)
     }
 

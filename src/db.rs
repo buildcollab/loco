@@ -286,8 +286,7 @@ use serde_json::{json, Value};
 #[allow(clippy::type_repetition_in_bounds)]
 pub async fn seed<A>(db: &DatabaseConnection, path: &str) -> crate::Result<()>
 where
-    <<A as ActiveModelTrait>::Entity as EntityTrait>::Model:
-        IntoActiveModel<A> + serde::Serialize,
+    <<A as ActiveModelTrait>::Entity as EntityTrait>::Model: IntoActiveModel<A> + serde::Serialize,
     for<'de> <<A as ActiveModelTrait>::Entity as EntityTrait>::Model: serde::de::Deserialize<'de>,
     A: ActiveModelTrait
         + Send

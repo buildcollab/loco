@@ -1,0 +1,7 @@
+# Pin the toolchain so local builds and CI use the same rustc / rustfmt /
+# clippy. Floating `stable` let formatting drift between contributors and CI;
+# a pin keeps `cargo fmt --all -- --check` deterministic.
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

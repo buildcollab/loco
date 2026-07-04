@@ -404,7 +404,17 @@ where
 
     let ctx = run_ctx(params, provider);
     if let Err(e) = params.hooks.on_run_start(&ctx).await {
-        return finalize_run(store, sink, params, &ctx, &msg, &parts, &total_usage, Err(e)).await;
+        return finalize_run(
+            store,
+            sink,
+            params,
+            &ctx,
+            &msg,
+            &parts,
+            &total_usage,
+            Err(e),
+        )
+        .await;
     }
 
     let result = run_loop(
@@ -424,7 +434,17 @@ where
     )
     .await;
 
-    finalize_run(store, sink, params, &ctx, &msg, &parts, &total_usage, result).await
+    finalize_run(
+        store,
+        sink,
+        params,
+        &ctx,
+        &msg,
+        &parts,
+        &total_usage,
+        result,
+    )
+    .await
 }
 
 /// Build the hook context for a run from its params + provider.
@@ -513,7 +533,17 @@ where
     K: EventSink,
     A: ToolAuthorizer,
 {
-    resume_impl(store, exec, provider, sink, params, authz, Some(subagents), item).await
+    resume_impl(
+        store,
+        exec,
+        provider,
+        sink,
+        params,
+        authz,
+        Some(subagents),
+        item,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -598,7 +628,14 @@ where
             {
                 Ok(SubagentStep::Interrupted { interrupt, state }) => {
                     bubble_subagent_interrupt(
-                        store, sink, params, &msg, &display_call, interrupt, state, &mut parts,
+                        store,
+                        sink,
+                        params,
+                        &msg,
+                        &display_call,
+                        interrupt,
+                        state,
+                        &mut parts,
                         &total_usage,
                     )
                     .await?;
@@ -631,15 +668,36 @@ where
                     });
                     history.push(ChatMessage::tool_result(&display_call.id, &res.to_string()));
                     run_loop(
-                        store, &exec, provider, sink, params, authz, subagents, &ctx, &msg,
-                        &mut history, &mut parts, &mut total_usage, &specs,
+                        store,
+                        &exec,
+                        provider,
+                        sink,
+                        params,
+                        authz,
+                        subagents,
+                        &ctx,
+                        &msg,
+                        &mut history,
+                        &mut parts,
+                        &mut total_usage,
+                        &specs,
                     )
                     .await
                 }
             }
         }
         .await;
-        return finalize_run(store, sink, params, &ctx, &msg, &parts, &total_usage, result).await;
+        return finalize_run(
+            store,
+            sink,
+            params,
+            &ctx,
+            &msg,
+            &parts,
+            &total_usage,
+            result,
+        )
+        .await;
     }
 
     let result: Result<LoopResult> = async {
@@ -654,7 +712,9 @@ where
             let (status, result) = match authz.authorize(&call, kind).await? {
                 ToolDecision::Deny { reason } => {
                     let denied = json!({ "denied": true, "reason": reason });
-                    store.complete_tool_call(&tref, "denied", &denied, 0).await?;
+                    store
+                        .complete_tool_call(&tref, "denied", &denied, 0)
+                        .await?;
                     ("denied", denied)
                 }
                 // An approved call is already past its approval gate, so treat a
@@ -720,7 +780,17 @@ where
     }
     .await;
 
-    finalize_run(store, sink, params, &ctx, &msg, &parts, &total_usage, result).await
+    finalize_run(
+        store,
+        sink,
+        params,
+        &ctx,
+        &msg,
+        &parts,
+        &total_usage,
+        result,
+    )
+    .await
 }
 
 /// Shared completion / error handling for both [`run_turn`] and [`resume`].
@@ -921,7 +991,9 @@ where
                             );
                             let denied = json!({ "denied": true, "reason": reason });
                             let tref = store.record_tool_call(msg, call, "denied").await?;
-                            store.complete_tool_call(&tref, "denied", &denied, 0).await?;
+                            store
+                                .complete_tool_call(&tref, "denied", &denied, 0)
+                                .await?;
                             sink.emit(AguiEvent::ToolCallResult {
                                 message_id: msg.id.clone(),
                                 tool_call_id: call.id.clone(),
@@ -1010,7 +1082,14 @@ where
                             }
                             Ok(SubagentStep::Interrupted { interrupt, state }) => {
                                 bubble_subagent_interrupt(
-                                    store, sink, params, msg, call, interrupt, state, parts,
+                                    store,
+                                    sink,
+                                    params,
+                                    msg,
+                                    call,
+                                    interrupt,
+                                    state,
+                                    parts,
                                     total_usage,
                                 )
                                 .await?;
@@ -1222,7 +1301,15 @@ where
     S: ConversationStore,
     K: EventSink,
 {
-    let tref = store.record_tool_call(&MessageRef { id: msg_id.to_string() }, call, "pending").await?;
+    let tref = store
+        .record_tool_call(
+            &MessageRef {
+                id: msg_id.to_string(),
+            },
+            call,
+            "pending",
+        )
+        .await?;
     store.complete_tool_call(&tref, status, result, 0).await?;
     sink.emit(AguiEvent::ToolCallResult {
         message_id: msg_id.to_string(),
@@ -1266,7 +1353,9 @@ where
             SUBAGENT_STATE_KEY: state,
         }),
     };
-    store.record_tool_call(msg, &pending_call, "pending").await?;
+    store
+        .record_tool_call(msg, &pending_call, "pending")
+        .await?;
     parts.push(part_tool_use(&call.id, &call.name, &call.arguments));
     sink.emit(AguiEvent::RunFinished {
         thread_id: params.thread_id.clone(),
@@ -1364,7 +1453,7 @@ where
 #[cfg(all(test, feature = "agui"))]
 mod tests {
     use super::*;
-    use crate::agui::protocol::{ResumePayload, ResumeItem};
+    use crate::agui::protocol::{ResumeItem, ResumePayload};
     use crate::agui::provider::{AgentDelta, StubProvider};
     use crate::agui::subagent::LocalSubagent;
     use std::sync::{Arc, Mutex};
@@ -1425,7 +1514,10 @@ mod tests {
     impl FakeStore {
         fn with_user(msg: &str) -> Self {
             let s = Self::default();
-            s.0.lock().unwrap().history.push(ChatMessage::text("user", msg));
+            s.0.lock()
+                .unwrap()
+                .history
+                .push(ChatMessage::text("user", msg));
             s
         }
         fn status(&self) -> String {
@@ -1476,7 +1568,9 @@ mod tests {
                 message_id: msg.id.clone(),
                 status: status.to_string(),
             });
-            Ok(ToolRef { id: call.id.clone() })
+            Ok(ToolRef {
+                id: call.id.clone(),
+            })
         }
         async fn complete_tool_call(
             &self,
@@ -1736,9 +1830,16 @@ mod tests {
         let sink = VecSink::default();
         let provider = StubProvider::with_reply("hi there friend");
 
-        run_turn(&store, Arc::new(FakeExec), &provider, &sink, &params(false), &AllowAll)
-            .await
-            .unwrap();
+        run_turn(
+            &store,
+            Arc::new(FakeExec),
+            &provider,
+            &sink,
+            &params(false),
+            &AllowAll,
+        )
+        .await
+        .unwrap();
 
         let names = sink.names();
         assert_eq!(names.first().unwrap(), "RUN_STARTED");
@@ -1756,9 +1857,16 @@ mod tests {
         let sink = VecSink::default();
         let provider = StubProvider::new();
 
-        run_turn(&store, Arc::new(FakeExec), &provider, &sink, &params(true), &AllowAll)
-            .await
-            .unwrap();
+        run_turn(
+            &store,
+            Arc::new(FakeExec),
+            &provider,
+            &sink,
+            &params(true),
+            &AllowAll,
+        )
+        .await
+        .unwrap();
 
         let names = sink.names();
         assert_eq!(names[0], "RUN_STARTED");
@@ -1783,9 +1891,16 @@ mod tests {
         let sink = VecSink::default();
         let provider = StubProvider::new();
 
-        run_turn(&store, Arc::new(FakeExec), &provider, &sink, &params(false), &AllowAll)
-            .await
-            .unwrap();
+        run_turn(
+            &store,
+            Arc::new(FakeExec),
+            &provider,
+            &sink,
+            &params(false),
+            &AllowAll,
+        )
+        .await
+        .unwrap();
 
         // Ends in an interrupt.
         match sink.events().last().unwrap() {
@@ -1810,9 +1925,16 @@ mod tests {
         let sink = VecSink::default();
         let provider = StubProvider::new();
 
-        run_turn(&store, Arc::new(FakeExec), &provider, &sink, &params(false), &AllowAll)
-            .await
-            .unwrap();
+        run_turn(
+            &store,
+            Arc::new(FakeExec),
+            &provider,
+            &sink,
+            &params(false),
+            &AllowAll,
+        )
+        .await
+        .unwrap();
         assert_eq!(store.status(), "responding");
 
         let resume_sink = VecSink::default();
@@ -1820,9 +1942,17 @@ mod tests {
             interrupt_id: "call_stub_save_note".to_string(),
             payload: ResumePayload { approved: true },
         };
-        resume(&store, Arc::new(FakeExec), &provider, &resume_sink, &params(false), &AllowAll, &item)
-            .await
-            .unwrap();
+        resume(
+            &store,
+            Arc::new(FakeExec),
+            &provider,
+            &resume_sink,
+            &params(false),
+            &AllowAll,
+            &item,
+        )
+        .await
+        .unwrap();
 
         let names = resume_sink.names();
         assert!(names.contains(&"TOOL_CALL_RESULT".to_string()));
@@ -1846,18 +1976,33 @@ mod tests {
         let sink = VecSink::default();
         let provider = StubProvider::new();
 
-        run_turn(&store, Arc::new(FakeExec), &provider, &sink, &params(false), &AllowAll)
-            .await
-            .unwrap();
+        run_turn(
+            &store,
+            Arc::new(FakeExec),
+            &provider,
+            &sink,
+            &params(false),
+            &AllowAll,
+        )
+        .await
+        .unwrap();
 
         let resume_sink = VecSink::default();
         let item = ResumeItem {
             interrupt_id: "call_stub_save_note".to_string(),
             payload: ResumePayload { approved: false },
         };
-        resume(&store, Arc::new(FakeExec), &provider, &resume_sink, &params(false), &AllowAll, &item)
-            .await
-            .unwrap();
+        resume(
+            &store,
+            Arc::new(FakeExec),
+            &provider,
+            &resume_sink,
+            &params(false),
+            &AllowAll,
+            &item,
+        )
+        .await
+        .unwrap();
 
         let names = resume_sink.names();
         assert!(names.contains(&"TOOL_CALL_RESULT".to_string()));
@@ -1877,9 +2022,16 @@ mod tests {
 
         // auto_approve = true so the *only* thing that can stop execution is the
         // authorizer, not the built-in write gate.
-        run_turn(&store, Arc::new(FakeExec), &provider, &sink, &params(true), &DenyAll)
-            .await
-            .unwrap();
+        run_turn(
+            &store,
+            Arc::new(FakeExec),
+            &provider,
+            &sink,
+            &params(true),
+            &DenyAll,
+        )
+        .await
+        .unwrap();
 
         let names = sink.names();
         // Never executed: no TOOL_CALL_START/ARGS/END were emitted.
@@ -1955,7 +2107,12 @@ mod tests {
         fn model_id(&self) -> String {
             "parent-model".to_string()
         }
-        async fn run_turn(&self, _s: &str, _h: &[ChatMessage], _t: &[ToolSpec]) -> Result<TurnOutcome> {
+        async fn run_turn(
+            &self,
+            _s: &str,
+            _h: &[ChatMessage],
+            _t: &[ToolSpec],
+        ) -> Result<TurnOutcome> {
             unreachable!("streaming only in this test")
         }
         async fn stream_turn(
@@ -2021,7 +2178,9 @@ mod tests {
     async fn subagent_write_bubbles_up_and_resumes_to_success() {
         let store = FakeStore::with_user("delegate please");
         let sink = VecSink::default();
-        let provider = DelegatingProvider { tool: "worker".to_string() };
+        let provider = DelegatingProvider {
+            tool: "worker".to_string(),
+        };
         let reg = worker_registry();
 
         // 1) Parent delegates → subagent's write tool interrupts → bubbles up.
@@ -2087,11 +2246,19 @@ mod tests {
     async fn subagent_denied_resume_still_finishes() {
         let store = FakeStore::with_user("delegate please");
         let sink = VecSink::default();
-        let provider = DelegatingProvider { tool: "worker".to_string() };
+        let provider = DelegatingProvider {
+            tool: "worker".to_string(),
+        };
         let reg = worker_registry();
 
         run_turn_with_subagents(
-            &store, Arc::new(FakeExec), &provider, &sink, &params(false), &AllowAll, &reg,
+            &store,
+            Arc::new(FakeExec),
+            &provider,
+            &sink,
+            &params(false),
+            &AllowAll,
+            &reg,
         )
         .await
         .unwrap();
@@ -2105,7 +2272,14 @@ mod tests {
             payload: ResumePayload { approved: false },
         };
         resume_with_subagents(
-            &store, Arc::new(FakeExec), &provider, &resume_sink, &params(false), &AllowAll, &reg, &item,
+            &store,
+            Arc::new(FakeExec),
+            &provider,
+            &resume_sink,
+            &params(false),
+            &AllowAll,
+            &reg,
+            &item,
         )
         .await
         .unwrap();
@@ -2143,13 +2317,22 @@ mod tests {
     async fn tool_panic_is_isolated_as_error_and_run_continues() {
         let store = FakeStore::with_user("go");
         let sink = VecSink::default();
-        let provider = DelegatingProvider { tool: "boom".to_string() };
+        let provider = DelegatingProvider {
+            tool: "boom".to_string(),
+        };
 
         // (A "thread panicked at 'kaboom'" line on stderr here is expected — it's
         // the caught panic; the run still completes successfully.)
-        run_turn(&store, Arc::new(PanicExec), &provider, &sink, &params(true), &AllowAll)
-            .await
-            .unwrap();
+        run_turn(
+            &store,
+            Arc::new(PanicExec),
+            &provider,
+            &sink,
+            &params(true),
+            &AllowAll,
+        )
+        .await
+        .unwrap();
 
         // The run finished successfully despite the panicking tool.
         match sink.events().last().unwrap() {
@@ -2193,7 +2376,9 @@ mod tests {
     async fn tool_timeout_aborts_and_yields_error() {
         let store = FakeStore::with_user("go");
         let sink = VecSink::default();
-        let provider = DelegatingProvider { tool: "slow".to_string() };
+        let provider = DelegatingProvider {
+            tool: "slow".to_string(),
+        };
         let mut p = params(true);
         p.tool_timeout = Some(Duration::from_millis(20));
 

@@ -10,8 +10,7 @@ use serde::Deserialize;
 use crate::{
     app::AppContext,
     cable::{inmem::InMemPubSub, Cable, Channel, ChannelRegistry},
-    tests_cfg,
-    Result,
+    tests_cfg, Result,
 };
 
 #[derive(Debug, Deserialize, Default)]
@@ -86,14 +85,22 @@ async fn end_to_end_publish_via_appcontext() {
 
     let channel = ChatChannel;
     let topics = channel
-        .subscribed(&ctx, ChatParams { room: Some("dev".into()) })
+        .subscribed(
+            &ctx,
+            ChatParams {
+                room: Some("dev".into()),
+            },
+        )
         .await
         .unwrap();
     assert_eq!(topics, vec!["chat:dev".to_string()]);
 
     let mut sub = cable.subscribe(&topics[0]).await.unwrap();
     tokio::time::sleep(Duration::from_millis(10)).await;
-    cable.publish(&topics[0], Bytes::from_static(b"hi")).await.unwrap();
+    cable
+        .publish(&topics[0], Bytes::from_static(b"hi"))
+        .await
+        .unwrap();
     let payload = tokio::time::timeout(Duration::from_secs(1), sub.recv())
         .await
         .unwrap()

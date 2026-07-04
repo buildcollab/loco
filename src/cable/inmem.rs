@@ -95,7 +95,9 @@ mod tests {
         // Tiny pause to let the forwarder task install its broadcast receiver
         // before we publish.
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        bus.publish("t1", Bytes::from_static(b"hello")).await.unwrap();
+        bus.publish("t1", Bytes::from_static(b"hello"))
+            .await
+            .unwrap();
         let got = tokio::time::timeout(std::time::Duration::from_secs(1), sub.recv())
             .await
             .unwrap();
@@ -115,6 +117,9 @@ mod tests {
         assert_eq!(got_a.as_deref(), Some(&b"x"[..]));
         // b should not receive
         let got_b = tokio::time::timeout(std::time::Duration::from_millis(50), b.recv()).await;
-        assert!(got_b.is_err(), "topic b should not receive topic a's message");
+        assert!(
+            got_b.is_err(),
+            "topic b should not receive topic a's message"
+        );
     }
 }

@@ -55,10 +55,7 @@ pub async fn build_test_app(cable: Cable) -> (AppContext, axum::Router) {
     let routes = AppRoutes::empty()
         .add_route(
             Routes::new()
-                .add(
-                    "/cable/chat",
-                    get(transport::ws_handler::<ChatChannel>),
-                )
+                .add("/cable/chat", get(transport::ws_handler::<ChatChannel>))
                 .add(
                     "/cable/chat/sse",
                     get(transport::sse_handler::<ChatChannel>),
@@ -87,11 +84,7 @@ pub fn serve(listener: TcpListener, router: axum::Router) {
 
 /// Connect a WebSocket client and drain until we either receive `predicate`
 /// returning `Some(value)` or hit the timeout.
-pub async fn ws_connect_and_recv_one(
-    addr: SocketAddr,
-    path: &str,
-    timeout: Duration,
-) -> Vec<u8> {
+pub async fn ws_connect_and_recv_one(addr: SocketAddr, path: &str, timeout: Duration) -> Vec<u8> {
     let url = format!("ws://{addr}{path}");
     let (mut ws, _) = tokio_tungstenite::connect_async(&url)
         .await
@@ -149,8 +142,8 @@ pub async fn pg_url_or_skip() -> Option<String> {
 pub async fn redis_url_or_skip() -> Option<String> {
     use redis::Client;
 
-    let uri =
-        std::env::var("LOCO_TEST_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let uri = std::env::var("LOCO_TEST_REDIS_URL")
+        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
 
     if let Ok(client) = Client::open(uri.clone()) {
         for _ in 0..3 {
@@ -173,11 +166,7 @@ pub async fn redis_url_or_skip() -> Option<String> {
 }
 
 /// Subscribe to the SSE endpoint and return the first `data:` line we see.
-pub async fn sse_connect_and_recv_one(
-    addr: SocketAddr,
-    path: &str,
-    timeout: Duration,
-) -> String {
+pub async fn sse_connect_and_recv_one(addr: SocketAddr, path: &str, timeout: Duration) -> String {
     let url = format!("http://{addr}{path}");
     let resp = reqwest::Client::new()
         .get(&url)

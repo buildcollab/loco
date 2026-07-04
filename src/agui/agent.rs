@@ -171,7 +171,8 @@ impl AgentRegistry {
 
     /// Register an agent under its [`name`](Agent::name).
     pub fn register<A: Agent + 'static>(&mut self, agent: A) -> &mut Self {
-        self.agents.insert(agent.name().to_string(), Arc::new(agent));
+        self.agents
+            .insert(agent.name().to_string(), Arc::new(agent));
         self
     }
 

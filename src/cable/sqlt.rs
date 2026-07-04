@@ -71,23 +71,15 @@ impl SqlitePubSub {
         let pool = SqlitePoolOptions::new()
             .max_connections(8)
             .connect(&cfg.uri)
-            .await
-            ?;
-        sqlx::query(ENSURE_TABLE_SQL)
-            .execute(&pool)
-            .await
-            ?;
-        sqlx::query(ENSURE_INDEX_SQL)
-            .execute(&pool)
-            .await
-            ?;
+            .await?;
+        sqlx::query(ENSURE_TABLE_SQL).execute(&pool).await?;
+        sqlx::query(ENSURE_INDEX_SQL).execute(&pool).await?;
 
         if cfg.dangerously_flush {
             tracing::warn!("cable_sqlt: flush mode enabled, truncating loco_cable_messages");
             sqlx::query("DELETE FROM loco_cable_messages")
                 .execute(&pool)
-                .await
-                ?;
+                .await?;
         }
 
         let me = Arc::new(Self {
@@ -179,16 +171,15 @@ impl SqlitePubSub {
 
     async fn gc(&self) {
         let cutoff_minutes = self.retention_minutes;
-        let _ = sqlx::query(
-            "DELETE FROM loco_cable_messages WHERE created_at < datetime('now', ?1)",
-        )
-        .bind(format!("-{cutoff_minutes} minutes"))
-        .execute(&self.pool)
-        .await
-        .map_err(|err| {
-            tracing::debug!(error = %err, "cable_sqlt: GC failed");
-            err
-        });
+        let _ =
+            sqlx::query("DELETE FROM loco_cable_messages WHERE created_at < datetime('now', ?1)")
+                .bind(format!("-{cutoff_minutes} minutes"))
+                .execute(&self.pool)
+                .await
+                .map_err(|err| {
+                    tracing::debug!(error = %err, "cable_sqlt: GC failed");
+                    err
+                });
     }
 }
 
@@ -199,8 +190,7 @@ impl PubSub for SqlitePubSub {
             .bind(topic)
             .bind(payload.as_ref())
             .execute(&self.pool)
-            .await
-            ?;
+            .await?;
         Ok(())
     }
 
@@ -212,8 +202,7 @@ impl PubSub for SqlitePubSub {
         )
         .bind(topic)
         .fetch_one(&self.pool)
-        .await
-        ?;
+        .await?;
 
         let last_seen = Arc::new(AtomicI64::new(max_id));
         let (tx, rx) = mpsc::unbounded_channel();

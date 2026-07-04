@@ -1,5 +1,4 @@
 pub use async_trait::async_trait;
-pub use bytes;
 pub use axum::{
     debug_handler,
     extract::{Form, Multipart, Path, Query, State},
@@ -7,6 +6,7 @@ pub use axum::{
     routing::{delete, get, head, options, patch, post, put, trace},
 };
 pub use axum_extra::extract::cookie;
+pub use bytes;
 pub use chrono::NaiveDateTime as DateTime;
 pub use include_dir::{include_dir, Dir};
 // some types required for controller generators
