@@ -32,23 +32,38 @@
 //! reconnecting client replays from a sequence number) and **cancellable** (an
 //! explicit stop flips the run's [`CancellationToken`]).
 //!
-//! `cargo loco generate agent <name>` scaffolds all of this into `src/agents/`
-//! plus a thin controller. The run handler, in outline:
+//! ## DB-backed subsystem (behind `with-db`)
+//!
+//! The persistence and HTTP wiring that used to be *generated into every app*
+//! now lives here as library code, so a project only writes agent-specific
+//! declarations:
+//!
+//! - [`entities`] — the framework-owned SeaORM entities for the agent tables.
+//! - [`store::DbStore`] — the [`ConversationStore`](runtime::ConversationStore)
+//!   over those tables.
+//! - [`hub::DbRunHub`] + [`run_hub`](hub::run_hub) — the multi-node run hub and
+//!   its config-driven selection.
+//! - [`service`] — the config-driven [`provider`](service::provider) +
+//!   [`assemble_system`](service::assemble_system) factories.
+//! - [`controller::routes`] — the reusable HTTP router (list / open / run /
+//!   stream / cancel).
+//! - [`worker`] — durable, background-worker-driven runs (`agui.execution`).
+//!
+//! `cargo loco generate agent <name>` now scaffolds only the migration and the
+//! per-agent modules (prompt / tools / hooks) plus a one-line controller that
+//! mounts [`controller::routes`] and a one-line worker registration. The run
+//! handler in outline (see [`controller`]):
 //!
 //! ```rust,ignore
-//! let agent = agents::registry().get(&conversation.agent_id)?;      // resolve by id
-//! let hub = runtime::run_hub(&ctx);                                 // in-mem or DB-backed
-//! let handle = hub.start(&run_id).await?;                           // buffer + cancel token
-//! let params = RunParams {
-//!     system, run_id, thread_id, agent: agent.name().into(),
-//!     hooks: agent.hooks(), cancel: handle.cancel.clone(), ..Default::default()
-//! };
-//! tokio::spawn(async move {                                         // decoupled from the connection
-//!     let sink = HubSink::new(hub.clone(), run_id.clone());         // publishes to the hub
-//!     let _ = run_turn(&store, Arc::new(agent.tools()), &provider, &sink, &params, &authz).await;
-//!     hub.finish(&run_id).await.ok();
-//! });
-//! Ok(hub_sse_response(hub.subscribe(&run_id, 0).await?).into_response())  // tail (or resume with ?since=N)
+//! let agent = registry.get(&conversation.agent_id)?;               // resolve by id
+//! let hub = run_hub(&ctx);                                         // in-mem or DB-backed
+//! let handle = hub.start(&run_id).await?;                          // buffer + cancel token
+//! service::set_active_run(&ctx.db, conv.id, Some(&run_id)).await?; // resumable/cancellable
+//! match execution {                                               // agui.execution
+//!     Inline => worker::spawn_inline(ctx.clone(), registry, args, handle.cancel),
+//!     Worker => worker::RunAgentJob::perform_later(&ctx, args).await?, // durable
+//! }
+//! Ok(hub_sse_response(hub.subscribe(&run_id, 0).await?).into_response())  // tail (or ?since=N)
 //! ```
 
 pub mod agent;
@@ -60,6 +75,20 @@ pub mod subagent;
 pub mod tool;
 pub mod transport;
 
+// DB-backed pieces (previously generated into every app): the framework-owned
+// entities, the `ConversationStore`, config-driven factories, the reusable HTTP
+// router, and the durable worker. Enabled together with the `with-db` feature.
+#[cfg(feature = "with-db")]
+pub mod controller;
+#[cfg(feature = "with-db")]
+pub mod entities;
+#[cfg(feature = "with-db")]
+pub mod service;
+#[cfg(feature = "with-db")]
+pub mod store;
+#[cfg(feature = "with-db")]
+pub mod worker;
+
 // Flat re-exports for ergonomic `use loco_rs::agui::{...}`.
 pub use agent::{
     Agent, AgentCtx, AgentHooks, AgentRegistry, NoopHooks, Principal, RunCtx,
@@ -68,6 +97,14 @@ pub use hub::{
     channel_stream, in_memory, HubEvent, HubEventStream, HubSink, InMemoryRunHub, RunHandle,
     RunHub, DEFAULT_BUFFER_CAP,
 };
+#[cfg(feature = "with-db")]
+pub use hub::{run_hub, DbRunHub};
+#[cfg(feature = "with-db")]
+pub use service::{assemble_system, clear_active_run, provider as config_provider, set_active_run};
+#[cfg(feature = "with-db")]
+pub use store::DbStore;
+#[cfg(feature = "with-db")]
+pub use worker::{execute, spawn_inline, RunAgentJob, RunArgs};
 // Re-exported so generated app code can build cancellation tokens / run hubs
 // without adding `tokio-util` as a direct dependency.
 pub use tokio_util::sync::CancellationToken;

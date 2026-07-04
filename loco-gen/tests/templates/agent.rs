@@ -62,14 +62,8 @@ fn can_generate() {
         "generate[agents_mod]",
         fs::read_to_string(agents_path.join("mod.rs")).expect("agents/mod.rs missing")
     );
-    assert_snapshot!(
-        "generate[agents_store]",
-        fs::read_to_string(agents_path.join("store.rs")).expect("agents/store.rs missing")
-    );
-    assert_snapshot!(
-        "generate[agents_runtime]",
-        fs::read_to_string(agents_path.join("runtime.rs")).expect("agents/runtime.rs missing")
-    );
+    // `store.rs` and `runtime.rs` are no longer generated — that logic is now
+    // library code in `loco_rs::agui` (store / hub / service / controller).
     assert_snapshot!(
         "generate[agent_dir_mod]",
         fs::read_to_string(agents_path.join("support").join("mod.rs")).expect("support/mod.rs missing")

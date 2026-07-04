@@ -27,7 +27,10 @@ use crate::{Error, Result};
 
 /// The authenticated principal driving a run, captured request-side and handed
 /// to prompt assembly / authorization. Kept minimal and app-agnostic.
-#[derive(Debug, Clone, Default)]
+///
+/// Serializable so it can be carried on a durable
+/// [worker job](crate::agui::worker) payload when a run is enqueued.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Principal {
     /// Scopes/permissions the caller holds (e.g. from a JWT `scopes` claim).
     pub scopes: Vec<String>,

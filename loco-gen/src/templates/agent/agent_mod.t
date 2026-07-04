@@ -38,7 +38,7 @@ use loco_rs::agui::{Agent, AgentCtx, AgentHooks, Tools};
 use loco_rs::prelude::*;
 
 /// Base system prompt for this agent. Edit freely; conversation context items
-/// are appended by [`crate::agents::runtime::assemble_system`].
+/// are appended by [`loco_rs::agui::assemble_system`].
 const SYSTEM_PROMPT: &str = "You are {{mod_name}}, a helpful assistant.";
 
 /// Default model. Overridden by `agui.provider.default_model` when set.
@@ -62,7 +62,7 @@ impl Agent for {{struct_name}}Agent {
     }
 
     async fn system_prompt(&self, ctx: &AgentCtx<'_>) -> Result<String> {
-        crate::agents::runtime::assemble_system(ctx, SYSTEM_PROMPT).await
+        loco_rs::agui::assemble_system(ctx, SYSTEM_PROMPT).await
     }
 
     fn tools(&self) -> Tools {

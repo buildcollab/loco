@@ -1,33 +1,50 @@
-to: src/agents/store.rs
-skip_exists: true
----
-//! `ConversationStore` implementation mapping the agent tables to the
-//! `loco_rs::agui` run-loop. Shared by every agent.
+//! # `ConversationStore` over the agent tables
+//!
+//! [`DbStore`] maps the framework-owned agent entities
+//! ([`entities`](super::entities)) onto the run-loop's
+//! [`ConversationStore`](super::runtime::ConversationStore) contract. It is
+//! **library** code shared by every agent: the generator no longer emits it —
+//! an app only needs the tables (via the generated migration) and this store is
+//! constructed for it by the framework controller.
 
 use async_trait::async_trait;
-use loco_rs::agui::{
-    history_from_parts, ChatMessage, ConversationStore, MessageRef, PendingToolCall, ToolCallReq,
-    ToolRef, Usage,
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel, QueryFilter,
+    Set,
 };
-use loco_rs::prelude::*;
 use serde_json::{json, Value};
+use uuid::Uuid;
 
-use crate::models::_entities::{conversations, messages, tool_calls};
+use super::entities::{conversations, messages, tool_calls};
+use super::provider::{history_from_parts, ChatMessage, ToolCallReq, Usage};
+use super::runtime::{ConversationStore, MessageRef, PendingToolCall, ToolRef};
+use crate::{Error, Result};
 
-/// Persistence for a single conversation.
+/// Persistence for a single conversation, keyed by its numeric id.
 pub struct DbStore {
+    /// The database connection (from `AppContext::db`).
     pub db: DatabaseConnection,
+    /// The conversation this store reads and writes.
     pub conversation_id: i32,
 }
 
 impl DbStore {
+    /// Build a store bound to `conversation_id` on `db`.
+    #[must_use]
+    pub fn new(db: DatabaseConnection, conversation_id: i32) -> Self {
+        Self {
+            db,
+            conversation_id,
+        }
+    }
+
     async fn find_message(&self, pid: &str) -> Result<messages::Model> {
         let uuid = Uuid::parse_str(pid).map_err(|e| Error::Message(e.to_string()))?;
         messages::Entity::find()
             .filter(messages::Column::Pid.eq(uuid))
             .one(&self.db)
             .await?
-            .ok_or_else(|| Error::NotFound)
+            .ok_or(Error::NotFound)
     }
 }
 
@@ -57,7 +74,9 @@ impl ConversationStore for DbStore {
             ..Default::default()
         };
         item.insert(&self.db).await?;
-        Ok(MessageRef { id: pid.to_string() })
+        Ok(MessageRef {
+            id: pid.to_string(),
+        })
     }
 
     async fn begin_assistant_message(&self, provider: &str, model: &str) -> Result<MessageRef> {
@@ -72,7 +91,9 @@ impl ConversationStore for DbStore {
             ..Default::default()
         };
         item.insert(&self.db).await?;
-        Ok(MessageRef { id: pid.to_string() })
+        Ok(MessageRef {
+            id: pid.to_string(),
+        })
     }
 
     async fn record_tool_call(
@@ -92,7 +113,9 @@ impl ConversationStore for DbStore {
             ..Default::default()
         };
         item.insert(&self.db).await?;
-        Ok(ToolRef { id: call.id.clone() })
+        Ok(ToolRef {
+            id: call.id.clone(),
+        })
     }
 
     async fn complete_tool_call(
@@ -106,7 +129,7 @@ impl ConversationStore for DbStore {
             .filter(tool_calls::Column::ToolCallId.eq(&tool.id))
             .one(&self.db)
             .await?
-            .ok_or_else(|| Error::NotFound)?;
+            .ok_or(Error::NotFound)?;
         let mut item = row.into_active_model();
         item.status = Set(status.to_string());
         item.result = Set(Some(result.clone()));
@@ -147,7 +170,7 @@ impl ConversationStore for DbStore {
         let message = messages::Entity::find_by_id(row.message_id)
             .one(&self.db)
             .await?
-            .ok_or_else(|| Error::NotFound)?;
+            .ok_or(Error::NotFound)?;
         Ok(Some(PendingToolCall {
             tool_call_id: row.tool_call_id,
             name: row.name,
@@ -160,7 +183,7 @@ impl ConversationStore for DbStore {
         let row = conversations::Entity::find_by_id(self.conversation_id)
             .one(&self.db)
             .await?
-            .ok_or_else(|| Error::NotFound)?;
+            .ok_or(Error::NotFound)?;
         let mut item = row.into_active_model();
         item.status = Set(Some(status.to_string()));
         item.update(&self.db).await?;

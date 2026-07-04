@@ -106,7 +106,11 @@ pub struct Interrupt {
 }
 
 /// Input body posted by the frontend to start (or resume) a run.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// `Serialize` is derived so the input can ride on a durable
+/// [worker job](crate::agui::worker) payload when a run is handed off to the
+/// background queue.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunAgentInput {
     #[serde(default)]
@@ -118,7 +122,7 @@ pub struct RunAgentInput {
 }
 
 /// A single resume instruction, answering a prior [`Interrupt`].
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResumeItem {
     pub interrupt_id: String,
@@ -126,7 +130,7 @@ pub struct ResumeItem {
 }
 
 /// Payload for a [`ResumeItem`] — currently a simple approve/deny gate.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResumePayload {
     pub approved: bool,
 }
