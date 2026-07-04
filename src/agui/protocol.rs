@@ -89,6 +89,10 @@ pub enum RunOutcome {
     Success,
     /// The run paused awaiting external input (e.g. approval).
     Interrupt,
+    /// The run was explicitly cancelled by the user (a "stop" request). Any
+    /// text produced before the cancel is persisted; the assistant message is
+    /// finalized as `"cancelled"`.
+    Cancelled,
 }
 
 /// Details of an interrupt that paused a run. The frontend echoes `id` back in

@@ -30,6 +30,7 @@ pub fn test_config() -> Config {
         database: get_database_config(),
         queue: None,
         cable: None,
+        agui: None,
         auth: None,
         workers: config::Workers {
             mode: config::WorkerMode::ForegroundBlocking,

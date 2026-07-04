@@ -11,57 +11,28 @@ pub struct Migration;
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, m: &SchemaManager) -> Result<(), DbErr> {
-        // Agents: the configured assistants a user can talk to.
-        create_table(
-            m,
-            "agents",
-            &[
-                ("id", ColType::PkAuto),
-                ("pid", ColType::UuidUniq),
-                ("name", ColType::String),
-                ("description", ColType::TextNull),
-                ("system_prompt", ColType::TextNull),
-                ("provider", ColType::String),
-                ("model", ColType::String),
-                ("default_mode", ColType::StringNull),
-                ("config", ColType::JsonBinaryNull),
-            ],
-            &[],
-        )
-        .await?;
-
-        // User-defined modes: named overlays (extra system prompt / config).
-        create_table(
-            m,
-            "agent_modes",
-            &[
-                ("id", ColType::PkAuto),
-                ("pid", ColType::UuidUniq),
-                ("name", ColType::String),
-                ("system_prompt", ColType::TextNull),
-                ("config", ColType::JsonBinaryNull),
-            ],
-            &[("agents", "")],
-        )
-        .await?;
-
-        // Conversations: a chat thread with an agent.
+        // Conversations: a chat thread with a code-declared agent. `agent_id` is
+        // the agent's registry name (declared in `src/agents/`); `active_run_id`
+        // points at the in-flight run so a client can resume or cancel it.
         create_table(
             m,
             "conversations",
             &[
                 ("id", ColType::PkAuto),
                 ("pid", ColType::UuidUniq),
+                ("agent_id", ColType::String),
                 ("title", ColType::StringNull),
                 ("mode", ColType::StringNull),
                 ("status", ColType::StringNull),
+                ("active_run_id", ColType::StringNull),
             ],
-            &[("agents", "")],
+            &[],
         )
         .await?;
 
-        // Messages: persisted turns (user / assistant / tool), with a `parts`
-        // JSON blob capturing the canonical AG-UI message parts.
+        // Messages: persisted turns (user / assistant / tool). The `parts` JSON
+        // blob captures the canonical AG-UI message parts and round-trips back
+        // into provider history losslessly (see `history_from_parts`).
         create_table(
             m,
             "messages",
@@ -116,16 +87,52 @@ impl MigrationTrait for Migration {
         )
         .await?;
 
+        // Run registry (multi-node run hub): one row per run. The owning node
+        // polls `cancel_requested` to stop a run; `last_seq` is the newest event
+        // sequence number.
+        create_table(
+            m,
+            "agent_runs",
+            &[
+                ("id", ColType::PkAuto),
+                ("pid", ColType::UuidUniq),
+                ("run_id", ColType::String),
+                ("conversation_id", ColType::IntegerNull),
+                ("status", ColType::String),
+                ("cancel_requested", ColType::BooleanWithDefault(false)),
+                ("last_seq", ColType::BigIntegerWithDefault(0)),
+            ],
+            &[],
+        )
+        .await?;
+
+        // Run events (multi-node run hub replay): the ordered per-run event log.
+        // A reconnecting client replays `seq > since` from here, then tails live.
+        create_table(
+            m,
+            "agent_events",
+            &[
+                ("id", ColType::PkAuto),
+                ("pid", ColType::UuidUniq),
+                ("run_id", ColType::String),
+                ("seq", ColType::BigInteger),
+                ("name", ColType::String),
+                ("payload", ColType::JsonBinaryNull),
+            ],
+            &[],
+        )
+        .await?;
+
         Ok(())
     }
 
     async fn down(&self, m: &SchemaManager) -> Result<(), DbErr> {
+        drop_table(m, "agent_events").await?;
+        drop_table(m, "agent_runs").await?;
         drop_table(m, "context_items").await?;
         drop_table(m, "tool_calls").await?;
         drop_table(m, "messages").await?;
         drop_table(m, "conversations").await?;
-        drop_table(m, "agent_modes").await?;
-        drop_table(m, "agents").await?;
         Ok(())
     }
 }
