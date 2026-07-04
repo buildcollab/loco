@@ -2,23 +2,37 @@
 source: loco-gen/tests/templates/agent.rs
 expression: collect_messages(&gen_result)
 ---
-* Agent controller `agents` was added.
+* Agent `support` scaffolded under `src/agents/support/`.
 
 Next steps:
   1. Enable the `agui` feature on loco-rs in Cargo.toml:
        loco-rs = { version = "*", features = ["agui"] }
-  2. Run the migration + entity sync:
+  2. Apply the migration + entity sync:
        $ cargo loco db migrate && cargo loco db entities
-  3. Set your OpenRouter key in the environment:
-       export OPENROUTER_API_KEY=sk-or-...
-  4. Seed an `agents` row (name, provider, model, system_prompt) and POST to
+  3. Configure the provider + hub under `agui:` in config/*.yaml (see the
+     `agui.provider.api_key` / `agui.hub` keys).
+  4. Open a conversation for agent id `support` and POST to
        /api/conversations/{conversation_pid}/run
-     with an AG-UI `RunAgentInput` body to stream a response. The `run`
-     endpoint requires a JWT; write tools additionally require a `memo:write`
-     entry in the token's `scopes` claim (see `AppAuthorizer`).
+     with an AG-UI `RunAgentInput` body to stream a response.
 
-This file is a starting point — customize the tools in `AgentTools`, the
-authorization policy in `AppAuthorizer`, the system-prompt assembly, and the
-message-history mapping to fit your app.
+Customize this agent's prompt/model here, its tools in `tools.rs`, and its
+lifecycle callbacks in `hooks.rs`.
+
+* Agent controller `agents` was added (thin HTTP layer over `src/agents/`).
+
+Endpoints (all under `/api`):
+  GET  agents                                  list declared agents
+  GET  agents/{agent_id}                        one agent
+  GET  agents/{agent_id}/conversations          list conversations
+  POST agents/{agent_id}/conversations          open a conversation
+  GET  conversations/{pid}/messages             message history
+  POST conversations/{pid}/context              attach context
+  POST conversations/{pid}/run                  start a run (SSE, resumable)
+  GET  conversations/{pid}/stream?since=N        resume the live stream
+  POST conversations/{pid}/cancel               stop the active run
+
+Frontend contract: POST `/run` to start and tail; on a dropped connection,
+GET `/stream?since=<lastEventId>` to resume (a fetch abort does NOT cancel the
+run); a Stop button calls POST `/cancel`.
 
 * Agent migration added! Apply it with `$ cargo loco db migrate && cargo loco db entities`.

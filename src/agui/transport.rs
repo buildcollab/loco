@@ -22,9 +22,10 @@
 use std::convert::Infallible;
 
 use axum::response::sse::{Event, KeepAlive, Sse};
-use futures_util::Stream;
+use futures_util::{Stream, StreamExt};
 use tokio::sync::mpsc;
 
+use crate::agui::hub::{HubEvent, HubEventStream};
 use crate::agui::protocol::AguiEvent;
 use crate::{Error, Result};
 
@@ -106,6 +107,28 @@ pub fn sse_response(
         rx.recv().await.map(|ev| (Ok(event_to_sse(&ev)), rx))
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// Serialize a numbered [`HubEvent`] into an SSE [`Event`], setting the SSE
+/// `id:` to the per-run sequence number. A reconnecting client echoes the last
+/// id it saw (as `Last-Event-ID` / a `since` query) to resume without gaps.
+#[must_use]
+pub fn hub_event_to_sse(ev: &HubEvent) -> Event {
+    Event::default()
+        .id(ev.seq.to_string())
+        .event(ev.name.clone())
+        .data(ev.data.to_string())
+}
+
+/// Build an SSE response from a [`RunHub`](crate::agui::hub::RunHub) stream
+/// (replay-then-tail). This is the resumable path: the stream keeps producing
+/// even across client reconnects, and each frame carries its `seq` as the SSE
+/// `id:`.
+pub fn hub_sse_response(
+    stream: HubEventStream,
+) -> Sse<impl Stream<Item = std::result::Result<Event, Infallible>>> {
+    let mapped = stream.map(|ev| Ok(hub_event_to_sse(&ev)));
+    Sse::new(mapped).keep_alive(KeepAlive::default())
 }
 
 /// Convenience: create the event channel, spawn `f(sink)` to drive a run, and

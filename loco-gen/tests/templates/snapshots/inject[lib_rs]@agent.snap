@@ -1,0 +1,6 @@
+---
+source: loco-gen/tests/templates/agent.rs
+expression: "fs::read_to_string(tree_fs.root.join(\"src\").join(\"lib.rs\")).expect(\"lib.rs injection failed\")"
+---
+pub mod controllers;
+pub mod agents;

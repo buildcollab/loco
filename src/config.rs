@@ -56,6 +56,10 @@ pub struct Config {
     /// When `None`, no cable provider is created and `AppContext.cable` is
     /// `None`.
     pub cable: Option<CableConfig>,
+    /// AG-UI streaming agent runtime configuration (LLM provider + run hub).
+    /// Only read by apps built on the `agui` feature; `None` when unused.
+    #[serde(default)]
+    pub agui: Option<AguiConfig>,
     pub auth: Option<Auth>,
     #[serde(default)]
     pub workers: Workers,
@@ -469,6 +473,85 @@ fn pgmq_visibility_timeout() -> i32 {
 
 fn pgmq_batch_size() -> i32 {
     10
+}
+
+/// AG-UI streaming agent runtime configuration.
+///
+/// Keeps the LLM provider credentials and the run-hub backend out of code, so
+/// deployments pick them at config time. Mirrors the [`CableConfig`] approach.
+///
+/// Example (development):
+/// ```yaml
+/// # config/development.yaml
+/// agui:
+///   provider:
+///     kind: openrouter
+///     api_key: "{{ get_env(name='OPENROUTER_API_KEY', default='') }}"
+///     default_model: anthropic/claude-sonnet-5
+///   hub:
+///     kind: in_mem
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AguiConfig {
+    /// LLM provider credentials and defaults.
+    pub provider: ProviderConfig,
+    /// Run-hub backend for resumable/cancellable streams. Defaults to in-memory
+    /// (single process) when omitted.
+    #[serde(default)]
+    pub hub: HubConfig,
+}
+
+/// LLM provider selection for the agent runtime. All variants are
+/// OpenAI-compatible HTTP; `kind` picks defaults (base URL, attribution).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProviderConfig {
+    /// OpenRouter (default base URL `https://openrouter.ai/api/v1`).
+    Openrouter(ProviderSettings),
+    /// OpenAI (`https://api.openai.com/v1`).
+    Openai(ProviderSettings),
+    /// Any OpenAI-compatible endpoint; `base_url` is required.
+    OpenaiCompatible(ProviderSettings),
+}
+
+/// Shared provider credentials/tunables.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct ProviderSettings {
+    /// API key. Prefer env interpolation in YAML so secrets stay out of files.
+    #[serde(default)]
+    pub api_key: String,
+    /// Override the provider's default base URL (required for
+    /// `openai_compatible`).
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// Default model when a conversation/agent does not specify one.
+    #[serde(default)]
+    pub default_model: Option<String>,
+}
+
+impl ProviderConfig {
+    /// The shared settings regardless of variant.
+    #[must_use]
+    pub fn settings(&self) -> &ProviderSettings {
+        match self {
+            Self::Openrouter(s) | Self::Openai(s) | Self::OpenaiCompatible(s) => s,
+        }
+    }
+}
+
+/// Run-hub backend: where per-run events are buffered and cancellation is
+/// coordinated. In-memory is single-process; the DB-backed variants support
+/// multi-node deploys (replay from a table, live fan-out via `cable`).
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HubConfig {
+    /// Process-local buffer + broadcast. Single node only.
+    #[default]
+    InMem,
+    /// Persist events to the DB and fan out over Redis `cable`. Multi-node.
+    Redis,
+    /// Persist events to the DB and fan out over Postgres `cable`. Multi-node.
+    Postgres,
 }
 
 /// User authentication configuration.

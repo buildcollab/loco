@@ -15,10 +15,16 @@ use crate::{render_template, AppInfo, GenerateResults, Result};
 ///
 /// # Errors
 /// Returns an error if the templates cannot be rendered.
-pub fn generate(rrgen: &RRgen, with_tz: bool, appinfo: &AppInfo) -> Result<GenerateResults> {
+pub fn generate(
+    rrgen: &RRgen,
+    name: &str,
+    with_tz: bool,
+    appinfo: &AppInfo,
+) -> Result<GenerateResults> {
     let ts = Utc::now();
     let vars = json!({
         "pkg_name": appinfo.app_name,
+        "name": name,
         "ts": ts,
         "with_tz": with_tz,
     });

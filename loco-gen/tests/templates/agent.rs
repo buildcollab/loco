@@ -11,11 +11,15 @@ fn can_generate() {
     settings.set_snapshot_suffix("agent");
     let _guard = settings.bind_to_scope();
 
-    let component = Component::Agent { with_tz: true };
+    let component = Component::Agent {
+        name: "support".to_string(),
+        with_tz: true,
+    };
 
     let tree_fs = tree_fs::TreeBuilder::default()
         .drop(true)
         .add_empty("src/controllers/mod.rs")
+        .add("src/lib.rs", "pub mod controllers;\n")
         .add("migration/src/lib.rs", MIGRATION_SRC_LIB)
         .add("src/app.rs", APP_ROUTS)
         .create()
@@ -52,6 +56,35 @@ fn can_generate() {
         );
     });
 
+    // AGENTS MODULE (shared + per-agent files)
+    let agents_path = tree_fs.root.join("src").join("agents");
+    assert_snapshot!(
+        "generate[agents_mod]",
+        fs::read_to_string(agents_path.join("mod.rs")).expect("agents/mod.rs missing")
+    );
+    assert_snapshot!(
+        "generate[agents_store]",
+        fs::read_to_string(agents_path.join("store.rs")).expect("agents/store.rs missing")
+    );
+    assert_snapshot!(
+        "generate[agents_runtime]",
+        fs::read_to_string(agents_path.join("runtime.rs")).expect("agents/runtime.rs missing")
+    );
+    assert_snapshot!(
+        "generate[agent_dir_mod]",
+        fs::read_to_string(agents_path.join("support").join("mod.rs")).expect("support/mod.rs missing")
+    );
+    assert_snapshot!(
+        "generate[agent_dir_tools]",
+        fs::read_to_string(agents_path.join("support").join("tools.rs"))
+            .expect("support/tools.rs missing")
+    );
+    assert_snapshot!(
+        "generate[agent_dir_hooks]",
+        fs::read_to_string(agents_path.join("support").join("hooks.rs"))
+            .expect("support/hooks.rs missing")
+    );
+
     // CONTROLLER
     let controllers_path = tree_fs.root.join("src").join("controllers");
     assert_snapshot!(
@@ -62,9 +95,14 @@ fn can_generate() {
         "inject[controller_mod_rs]",
         fs::read_to_string(controllers_path.join("mod.rs")).expect("mod.rs injection failed")
     );
+
+    // INJECTIONS into lib.rs (module decl + agent registration)
+    assert_snapshot!(
+        "inject[lib_rs]",
+        fs::read_to_string(tree_fs.root.join("src").join("lib.rs")).expect("lib.rs injection failed")
+    );
     assert_snapshot!(
         "inject[app_rs]",
-        fs::read_to_string(tree_fs.root.join("src").join("app.rs"))
-            .expect("app.rs injection failed")
+        fs::read_to_string(tree_fs.root.join("src").join("app.rs")).expect("app.rs injection failed")
     );
 }

@@ -17,7 +17,11 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 use tracing::{debug, warn};
 
+use crate::config::ProviderConfig;
 use crate::{Error, Result};
+
+/// Default base URL for the OpenAI API (used by [`ProviderConfig::Openai`]).
+pub const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 
 /// A single incremental item produced while streaming a turn.
 #[derive(Debug, Clone)]
@@ -113,6 +117,86 @@ impl ChatMessage {
             tool_call_id: Some(tool_call_id.to_string()),
         }
     }
+}
+
+/// Rebuild the provider-facing history from persisted AG-UI message `parts`.
+///
+/// This is the inverse of the [`crate::agui::protocol`] part builders
+/// (`part_text` / `part_tool_use` / `part_tool_result`) and is **lossless across
+/// multi-turn tool use**: an assistant message that called tools replays with its
+/// `tool_calls`, followed by the `tool` result messages the model needs to see.
+///
+/// Each input row is `(role, parts, fallback_content)`:
+/// - `parts` is the persisted JSON array (the `messages.parts` column). `text`
+///   parts concatenate into the message content; `tool_use` parts become
+///   `tool_calls`; each `tool_result` part becomes a trailing `role: "tool"`
+///   message (OpenAI ordering: the assistant tool-call message precedes its
+///   results).
+/// - When `parts` is `None`/not an array (rows written before parts existed),
+///   the row falls back to `fallback_content` as plain text.
+#[must_use]
+pub fn history_from_parts(
+    rows: impl IntoIterator<Item = (String, Option<Value>, Option<String>)>,
+) -> Vec<ChatMessage> {
+    let mut out = Vec::new();
+    for (role, parts, fallback) in rows {
+        let Some(Value::Array(parts)) = parts else {
+            // No structured parts — replay the plain text we have.
+            out.push(ChatMessage::text(&role, &fallback.unwrap_or_default()));
+            continue;
+        };
+
+        let mut text = String::new();
+        let mut tool_calls = Vec::new();
+        let mut tool_results = Vec::new();
+        for part in &parts {
+            match part.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    if let Some(t) = part.get("text").and_then(Value::as_str) {
+                        text.push_str(t);
+                    }
+                }
+                Some("tool_use") => {
+                    let id = part
+                        .get("toolCallId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let name = part
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let arguments = part.get("input").cloned().unwrap_or_else(|| json!({}));
+                    tool_calls.push(ToolCallReq {
+                        id: id.to_string(),
+                        name: name.to_string(),
+                        arguments,
+                    });
+                }
+                Some("tool_result") => {
+                    let id = part
+                        .get("toolCallId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let content = part.get("content").map_or_else(
+                        || String::new(),
+                        |c| c.as_str().map_or_else(|| c.to_string(), ToString::to_string),
+                    );
+                    tool_results.push(ChatMessage::tool_result(id, &content));
+                }
+                _ => {}
+            }
+        }
+
+        // The assistant (or user) message first, then any tool results it carries.
+        out.push(ChatMessage {
+            role,
+            content: text,
+            tool_calls,
+            tool_call_id: None,
+        });
+        out.append(&mut tool_results);
+    }
+    out
 }
 
 /// The assembled result of a turn.
@@ -539,6 +623,30 @@ impl RigProvider {
         model: impl Into<String>,
     ) -> Self {
         Self::with_config(api_key, base_url, model, RigConfig::default())
+    }
+
+    /// Build a provider from an [`AguiConfig`](crate::config::AguiConfig)'s
+    /// provider section — the config-driven path used by generated controllers
+    /// (no `std::env` reads). `model` is the resolved model for this run.
+    ///
+    /// The base URL comes from the provider `kind` (OpenRouter / OpenAI) unless
+    /// the config overrides it; `openai_compatible` requires an explicit
+    /// `base_url`.
+    #[must_use]
+    pub fn from_config(cfg: &ProviderConfig, model: impl Into<String>) -> Self {
+        let settings = cfg.settings();
+        let base_url = match cfg {
+            // `None` lets `new` fall back to the OpenRouter default.
+            ProviderConfig::Openrouter(_) => settings.base_url.clone(),
+            ProviderConfig::Openai(_) => Some(
+                settings
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(|| OPENAI_BASE_URL.to_string()),
+            ),
+            ProviderConfig::OpenaiCompatible(_) => settings.base_url.clone(),
+        };
+        Self::new(settings.api_key.clone(), base_url, model)
     }
 
     /// Build a provider with explicit [`RigConfig`] tunables.
@@ -1107,6 +1215,51 @@ fn chunk_words(text: &str, n: usize) -> Vec<String> {
 mod tests {
     use super::*;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn history_from_parts_text_only_and_fallback() {
+        let rows = vec![
+            (
+                "user".to_string(),
+                Some(json!([{ "type": "text", "text": "hello" }])),
+                None,
+            ),
+            // Legacy row with no structured parts falls back to plain content.
+            ("assistant".to_string(), None, Some("hi there".to_string())),
+        ];
+        let msgs = history_from_parts(rows);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[0].content, "hello");
+        assert!(msgs[0].tool_calls.is_empty());
+        assert_eq!(msgs[1].role, "assistant");
+        assert_eq!(msgs[1].content, "hi there");
+    }
+
+    #[test]
+    fn history_from_parts_tool_roundtrip() {
+        // assistant: some text + a tool_use + its tool_result (as persisted).
+        let rows = vec![(
+            "assistant".to_string(),
+            Some(json!([
+                { "type": "text", "text": "let me check" },
+                { "type": "tool_use", "toolCallId": "c1", "name": "get_time", "input": {} },
+                { "type": "tool_result", "toolCallId": "c1", "status": "ok", "content": { "time": "now" } },
+            ])),
+            None,
+        )];
+        let msgs = history_from_parts(rows);
+        // Assistant message (with tool_calls) then the tool result message.
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, "assistant");
+        assert_eq!(msgs[0].content, "let me check");
+        assert_eq!(msgs[0].tool_calls.len(), 1);
+        assert_eq!(msgs[0].tool_calls[0].id, "c1");
+        assert_eq!(msgs[0].tool_calls[0].name, "get_time");
+        assert_eq!(msgs[1].role, "tool");
+        assert_eq!(msgs[1].tool_call_id.as_deref(), Some("c1"));
+        assert!(msgs[1].content.contains("now"));
+    }
 
     fn write_spec() -> ToolSpec {
         ToolSpec {

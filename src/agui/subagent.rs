@@ -170,9 +170,11 @@ impl<P, E, A> LocalSubagent<P, E, A> {
             system: self.system.clone(),
             run_id: format!("sub-{}-{}", self.name, ctx.depth),
             thread_id: format!("sub-{}", self.name),
+            agent: self.name.clone(),
             auto_approve,
             max_tool_turns: self.max_tool_turns,
             tool_timeout: None,
+            ..Default::default()
         }
     }
 
@@ -713,6 +715,7 @@ mod tests {
         run_turn(&store, Arc::new(EchoTools), &provider, &NullSink, &RunParams {
             system: "s".into(), run_id: "r".into(), thread_id: "t".into(),
             auto_approve: true, max_tool_turns: 3, tool_timeout: None,
+            ..Default::default()
         }, &AllowAll).await.unwrap();
         assert!(store.final_text().contains("hello"));
     }

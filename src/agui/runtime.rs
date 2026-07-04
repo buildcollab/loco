@@ -38,8 +38,10 @@ use std::time::{Duration, Instant};
 
 use futures_util::FutureExt;
 use serde_json::{json, Value};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
+use crate::agui::agent::{AgentHooks, NoopHooks, RunCtx};
 use crate::agui::protocol::{
     part_text, part_tool_result, part_tool_use, AguiEvent, Interrupt, ResumeItem, RunOutcome,
 };
@@ -172,6 +174,15 @@ impl<T: ?Sized + ToolAuthorizer> ToolAuthorizer for Box<T> {
     }
 }
 
+/// Forwarding impl so `Arc<dyn ToolAuthorizer>` (the form an app hands the
+/// run-loop after resolving a per-agent policy) is itself a [`ToolAuthorizer`].
+#[async_trait::async_trait]
+impl<T: ?Sized + ToolAuthorizer> ToolAuthorizer for Arc<T> {
+    async fn authorize(&self, call: &ToolCallReq, kind: ToolKind) -> Result<ToolDecision> {
+        (**self).authorize(call, kind).await
+    }
+}
+
 /// App-supplied persistence for a single conversation. All ids returned here
 /// are public-id strings echoed back in emitted events.
 #[async_trait::async_trait]
@@ -220,11 +231,13 @@ pub trait ConversationStore: Send + Sync {
 }
 
 /// Parameters for a run.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RunParams {
     pub system: String,
     pub run_id: String,
     pub thread_id: String,
+    /// The agent id driving the run (surfaced to hooks via [`RunCtx`]).
+    pub agent: String,
     /// When `true`, write tools execute without an approval interrupt.
     pub auto_approve: bool,
     /// Maximum provider turns (streaming rounds) before the loop stops.
@@ -233,6 +246,44 @@ pub struct RunParams {
     /// exceeds this, the task is aborted and the call becomes an `error` result.
     /// `None` = no deadline (still isolated on its own task, aborted on cancel).
     pub tool_timeout: Option<Duration>,
+    /// Lifecycle hooks fired around the run / each turn / each tool call.
+    /// Defaults to a no-op; a trait object to avoid another run-loop generic.
+    pub hooks: Arc<dyn AgentHooks>,
+    /// Cooperative cancellation for an explicit "stop". The loop polls this
+    /// between turns and around tool calls, and races it during streaming; on
+    /// cancel it persists partial output and finalizes as `"cancelled"`.
+    pub cancel: CancellationToken,
+}
+
+impl Default for RunParams {
+    fn default() -> Self {
+        Self {
+            system: String::new(),
+            run_id: String::new(),
+            thread_id: String::new(),
+            agent: String::new(),
+            auto_approve: false,
+            max_tool_turns: 8,
+            tool_timeout: None,
+            hooks: Arc::new(NoopHooks),
+            cancel: CancellationToken::new(),
+        }
+    }
+}
+
+impl std::fmt::Debug for RunParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunParams")
+            .field("system", &self.system)
+            .field("run_id", &self.run_id)
+            .field("thread_id", &self.thread_id)
+            .field("agent", &self.agent)
+            .field("auto_approve", &self.auto_approve)
+            .field("max_tool_turns", &self.max_tool_turns)
+            .field("tool_timeout", &self.tool_timeout)
+            .field("cancelled", &self.cancel.is_cancelled())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Outcome of the inner streaming loop.
@@ -241,6 +292,16 @@ enum LoopResult {
     Completed,
     /// The loop paused for approval and already finalized the message + status.
     Interrupted,
+    /// The run was cancelled (explicit stop); any partial text is in `parts`.
+    Cancelled,
+}
+
+/// Result of streaming one provider turn.
+enum StreamResult {
+    /// The turn assembled normally.
+    Completed(TurnOutcome),
+    /// The turn was cancelled mid-stream; carries the text streamed so far.
+    Cancelled(String),
 }
 
 /// Start a fresh agent turn. The app is expected to have persisted the user's
@@ -341,6 +402,11 @@ where
     let mut parts: Vec<Value> = Vec::new();
     let mut total_usage = Usage::default();
 
+    let ctx = run_ctx(params, provider);
+    if let Err(e) = params.hooks.on_run_start(&ctx).await {
+        return finalize_run(store, sink, params, &ctx, &msg, &parts, &total_usage, Err(e)).await;
+    }
+
     let result = run_loop(
         store,
         &exec,
@@ -349,6 +415,7 @@ where
         params,
         authz,
         subagents,
+        &ctx,
         &msg,
         &mut history,
         &mut parts,
@@ -357,7 +424,17 @@ where
     )
     .await;
 
-    finalize_run(store, sink, params, &msg, &parts, &total_usage, result).await
+    finalize_run(store, sink, params, &ctx, &msg, &parts, &total_usage, result).await
+}
+
+/// Build the hook context for a run from its params + provider.
+fn run_ctx<P: Provider>(params: &RunParams, provider: &P) -> RunCtx {
+    RunCtx {
+        run_id: params.run_id.clone(),
+        thread_id: params.thread_id.clone(),
+        agent: params.agent.clone(),
+        model: provider.model_id().to_string(),
+    }
 }
 
 /// The tool specs the provider should see: the executor's tools plus one entry
@@ -481,6 +558,7 @@ where
     let specs = merged_specs(&*exec, subagents);
     let mut parts: Vec<Value> = Vec::new();
     let mut total_usage = Usage::default();
+    let ctx = run_ctx(params, provider);
 
     let call = ToolCallReq {
         id: pending.tool_call_id.clone(),
@@ -506,7 +584,7 @@ where
             name: pending.name.clone(),
             arguments: json!({ "input": pending.arguments.get("input").cloned().unwrap_or(Value::Null) }),
         };
-        let ctx = SubagentCtx {
+        let subctx = SubagentCtx {
             depth: 1,
             max_depth: reg.max_depth(),
         };
@@ -514,7 +592,7 @@ where
         let result: Result<LoopResult> = async {
             match catch_panic(
                 &pending.name,
-                agent.resume_step(state, item.payload.approved, &ctx, child_sink.as_ref()),
+                agent.resume_step(state, item.payload.approved, &subctx, child_sink.as_ref()),
             )
             .await
             {
@@ -553,15 +631,15 @@ where
                     });
                     history.push(ChatMessage::tool_result(&display_call.id, &res.to_string()));
                     run_loop(
-                        store, &exec, provider, sink, params, authz, subagents, &msg, &mut history,
-                        &mut parts, &mut total_usage, &specs,
+                        store, &exec, provider, sink, params, authz, subagents, &ctx, &msg,
+                        &mut history, &mut parts, &mut total_usage, &specs,
                     )
                     .await
                 }
             }
         }
         .await;
-        return finalize_run(store, sink, params, &msg, &parts, &total_usage, result).await;
+        return finalize_run(store, sink, params, &ctx, &msg, &parts, &total_usage, result).await;
     }
 
     let result: Result<LoopResult> = async {
@@ -582,7 +660,11 @@ where
                 // An approved call is already past its approval gate, so treat a
                 // repeated `RequireApproval` as an allow rather than looping.
                 ToolDecision::Allow | ToolDecision::RequireApproval { .. } => {
-                    execute_and_record(&exec, store, &tref, &call, params.tool_timeout).await?
+                    params.hooks.before_tool(&ctx, &call).await?;
+                    let (s, r) =
+                        execute_and_record(&exec, store, &tref, &call, params.tool_timeout).await?;
+                    params.hooks.after_tool(&ctx, &call, &r).await?;
+                    (s, r)
                 }
             };
             parts.push(part_tool_use(&call.id, &call.name, &call.arguments));
@@ -612,6 +694,7 @@ where
                 params,
                 authz,
                 subagents,
+                &ctx,
                 &msg,
                 &mut history,
                 &mut parts,
@@ -637,14 +720,16 @@ where
     }
     .await;
 
-    finalize_run(store, sink, params, &msg, &parts, &total_usage, result).await
+    finalize_run(store, sink, params, &ctx, &msg, &parts, &total_usage, result).await
 }
 
 /// Shared completion / error handling for both [`run_turn`] and [`resume`].
+#[allow(clippy::too_many_arguments)]
 async fn finalize_run<S, K>(
     store: &S,
     sink: &K,
     params: &RunParams,
+    ctx: &RunCtx,
     msg: &MessageRef,
     parts: &[Value],
     total_usage: &Usage,
@@ -678,10 +763,40 @@ where
                 interrupt: None,
             })
             .await?;
+            let _ = params.hooks.on_run_end(ctx).await;
+            Ok(())
+        }
+        // Explicit cancel ("stop"): persist whatever was produced and mark the
+        // message/conversation cancelled — distinct from an error.
+        Ok(LoopResult::Cancelled) => {
+            info!(target: "loco_rs::agui", run_id = %params.run_id, "agent run cancelled");
+            let _ = sink
+                .emit(AguiEvent::TextMessageEnd {
+                    message_id: msg.id.clone(),
+                })
+                .await;
+            store
+                .finalize_assistant_message(
+                    msg,
+                    Value::Array(parts.to_vec()),
+                    total_usage,
+                    "cancelled",
+                )
+                .await?;
+            store.set_conversation_status("idle").await?;
+            sink.emit(AguiEvent::RunFinished {
+                thread_id: params.thread_id.clone(),
+                run_id: params.run_id.clone(),
+                outcome: RunOutcome::Cancelled,
+                interrupt: None,
+            })
+            .await?;
+            let _ = params.hooks.on_run_end(ctx).await;
             Ok(())
         }
         Err(e) => {
             error!(target: "loco_rs::agui", error = %e, run_id = %params.run_id, "agent run failed");
+            params.hooks.on_error(ctx, &e).await;
             // Best-effort teardown; ignore secondary errors.
             let _ = sink
                 .emit(AguiEvent::RunError {
@@ -715,6 +830,7 @@ async fn run_loop<S, E, P, K, A>(
     params: &RunParams,
     authz: &A,
     subagents: Option<&SubagentRegistry>,
+    ctx: &RunCtx,
     msg: &MessageRef,
     history: &mut Vec<ChatMessage>,
     parts: &mut Vec<Value>,
@@ -729,7 +845,33 @@ where
     A: ToolAuthorizer,
 {
     for _turn in 0..params.max_tool_turns.max(1) {
-        let outcome = stream_one_turn(provider, sink, &params.system, &msg.id, history, specs).await?;
+        // Cancellation is cooperative: bail out at each turn boundary.
+        if params.cancel.is_cancelled() {
+            return Ok(LoopResult::Cancelled);
+        }
+
+        params.hooks.before_message(ctx).await?;
+        let outcome = match stream_one_turn(
+            provider,
+            sink,
+            &params.system,
+            &msg.id,
+            history,
+            specs,
+            &params.cancel,
+        )
+        .await?
+        {
+            // Cancelled mid-stream: keep whatever text was produced.
+            StreamResult::Cancelled(text) => {
+                if !text.is_empty() {
+                    parts.push(part_text(&text));
+                }
+                return Ok(LoopResult::Cancelled);
+            }
+            StreamResult::Completed(outcome) => outcome,
+        };
+        params.hooks.after_message(ctx, &outcome).await?;
 
         match outcome {
             TurnOutcome::Final { text, usage } => {
@@ -758,6 +900,9 @@ where
                 });
 
                 for call in &calls {
+                    if params.cancel.is_cancelled() {
+                        return Ok(LoopResult::Cancelled);
+                    }
                     let kind = specs
                         .iter()
                         .find(|s| s.name == call.name)
@@ -883,6 +1028,8 @@ where
                     }
 
                     // Read tool, or write tool with auto-approve: execute now.
+                    // `before_tool` fires only after authorization allowed it.
+                    params.hooks.before_tool(ctx, call).await?;
                     let tref = store.record_tool_call(msg, call, "pending").await?;
                     sink.emit(AguiEvent::ToolCallStart {
                         tool_call_id: call.id.clone(),
@@ -902,6 +1049,7 @@ where
 
                     let (status, result) =
                         execute_and_record(exec, store, &tref, call, params.tool_timeout).await?;
+                    params.hooks.after_tool(ctx, call, &result).await?;
                     sink.emit(AguiEvent::ToolCallResult {
                         message_id: msg.id.clone(),
                         tool_call_id: call.id.clone(),
@@ -1153,7 +1301,8 @@ async fn stream_one_turn<P, K>(
     msg_id: &str,
     history: &[ChatMessage],
     specs: &[ToolSpec],
-) -> Result<TurnOutcome>
+    cancel: &CancellationToken,
+) -> Result<StreamResult>
 where
     P: Provider,
     K: EventSink,
@@ -1161,6 +1310,10 @@ where
     use crate::agui::provider::AgentDelta;
 
     let (dtx, mut drx) = tokio::sync::mpsc::channel::<AgentDelta>(64);
+    // Accumulate streamed text out-of-band so a mid-stream cancel can still
+    // persist the partial assistant message (the assembled `TurnOutcome` is lost
+    // when the provider future is dropped on cancel).
+    let streamed = Arc::new(std::sync::Mutex::new(String::new()));
 
     let provider_fut = async move {
         let r = provider.stream_turn(system, history, specs, &dtx).await;
@@ -1169,9 +1322,16 @@ where
         r
     };
 
+    let streamed_fwd = Arc::clone(&streamed);
     let forward_fut = async move {
         while let Some(delta) = drx.recv().await {
             if let AgentDelta::TextDelta(text) = delta {
+                {
+                    streamed_fwd
+                        .lock()
+                        .expect("streamed text mutex")
+                        .push_str(&text);
+                }
                 sink.emit(AguiEvent::TextMessageContent {
                     message_id: msg_id.to_string(),
                     delta: text,
@@ -1182,10 +1342,23 @@ where
         Ok::<(), Error>(())
     };
 
-    let (out_res, fwd_res) = tokio::join!(provider_fut, forward_fut);
-    // Surface a sink error (client disconnect) as the abort signal first.
-    fwd_res?;
-    out_res
+    let combined = async move {
+        let (out_res, fwd_res) = tokio::join!(provider_fut, forward_fut);
+        // Surface a sink error as the abort signal first.
+        fwd_res?;
+        out_res
+    };
+
+    // Race the turn against an explicit stop. `biased` prefers normal
+    // completion when both are ready.
+    tokio::select! {
+        biased;
+        res = combined => Ok(StreamResult::Completed(res?)),
+        () = cancel.cancelled() => {
+            let text = streamed.lock().expect("streamed text mutex").clone();
+            Ok(StreamResult::Cancelled(text))
+        }
+    }
 }
 
 #[cfg(all(test, feature = "agui"))]
@@ -1408,10 +1581,154 @@ mod tests {
             auto_approve,
             max_tool_turns: 5,
             tool_timeout: None,
+            ..Default::default()
+        }
+    }
+
+    /// Shared ordered log for hook / authorization tests.
+    #[derive(Clone, Default)]
+    struct EventLog(Arc<Mutex<Vec<String>>>);
+    impl EventLog {
+        fn push(&self, s: &str) {
+            self.0.lock().unwrap().push(s.to_string());
+        }
+        fn entries(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    struct RecordingHooks(EventLog);
+    #[async_trait::async_trait]
+    impl AgentHooks for RecordingHooks {
+        async fn on_run_start(&self, _c: &RunCtx) -> Result<()> {
+            self.0.push("on_run_start");
+            Ok(())
+        }
+        async fn on_run_end(&self, _c: &RunCtx) -> Result<()> {
+            self.0.push("on_run_end");
+            Ok(())
+        }
+        async fn before_message(&self, _c: &RunCtx) -> Result<()> {
+            self.0.push("before_message");
+            Ok(())
+        }
+        async fn after_message(&self, _c: &RunCtx, _o: &TurnOutcome) -> Result<()> {
+            self.0.push("after_message");
+            Ok(())
+        }
+        async fn before_tool(&self, _c: &RunCtx, _call: &ToolCallReq) -> Result<()> {
+            self.0.push("before_tool");
+            Ok(())
+        }
+        async fn after_tool(&self, _c: &RunCtx, _call: &ToolCallReq, _r: &Value) -> Result<()> {
+            self.0.push("after_tool");
+            Ok(())
+        }
+    }
+
+    struct RecordingAuthorizer(EventLog);
+    #[async_trait::async_trait]
+    impl ToolAuthorizer for RecordingAuthorizer {
+        async fn authorize(&self, _call: &ToolCallReq, _kind: ToolKind) -> Result<ToolDecision> {
+            self.0.push("authorize");
+            Ok(ToolDecision::Allow)
         }
     }
 
     // ----- tests -------------------------------------------------------------
+
+    #[tokio::test]
+    async fn hooks_fire_in_order_and_after_authorization() {
+        let store = FakeStore::with_user("please update the note");
+        let sink = VecSink::default();
+        // Tool call on turn 1, final answer on turn 2.
+        let provider = StubProvider::new();
+        let log = EventLog::default();
+        let p = RunParams {
+            system: "s".to_string(),
+            run_id: "r".to_string(),
+            thread_id: "t".to_string(),
+            agent: "tester".to_string(),
+            auto_approve: true,
+            max_tool_turns: 5,
+            tool_timeout: None,
+            hooks: Arc::new(RecordingHooks(log.clone())),
+            ..Default::default()
+        };
+        // Boxed authorizer exercises the `Arc<dyn ToolAuthorizer>` forwarding.
+        let authz: Arc<dyn ToolAuthorizer> = Arc::new(RecordingAuthorizer(log.clone()));
+
+        run_turn(&store, Arc::new(FakeExec), &provider, &sink, &p, &authz)
+            .await
+            .unwrap();
+
+        let e = log.entries();
+        assert_eq!(e.first().unwrap(), "on_run_start");
+        assert_eq!(e.last().unwrap(), "on_run_end");
+        let pos = |name: &str| e.iter().position(|x| x == name).unwrap();
+        // Authorization decides before the tool hooks fire.
+        assert!(pos("authorize") < pos("before_tool"));
+        // before_tool is immediately followed by after_tool.
+        assert_eq!(pos("after_tool"), pos("before_tool") + 1);
+        // Each turn brackets its message hooks.
+        assert!(pos("before_message") < pos("after_message"));
+    }
+
+    #[tokio::test]
+    async fn hub_backed_run_streams_to_subscriber() {
+        use crate::agui::hub::{HubSink, InMemoryRunHub, RunHub};
+        use futures_util::StreamExt;
+
+        let store = FakeStore::with_user("hello");
+        let provider = StubProvider::with_reply("hi there");
+        let hub: Arc<dyn RunHub> = Arc::new(InMemoryRunHub::default());
+        let handle = hub.start("run1").await.unwrap();
+
+        // Drive the run into the hub (as the generated controller does).
+        let sink = HubSink::new(hub.clone(), "run1");
+        let mut p = params(false);
+        p.run_id = "run1".to_string();
+        p.cancel = handle.cancel.clone();
+        run_turn(&store, Arc::new(FakeExec), &provider, &sink, &p, &AllowAll)
+            .await
+            .unwrap();
+        hub.finish("run1").await.unwrap();
+
+        // Replay the run from the start; the client stops on the terminal event.
+        let mut stream = hub.subscribe("run1", 0).await.unwrap();
+        let mut names = Vec::new();
+        while let Some(ev) = stream.next().await {
+            let terminal = ev.name == "RUN_FINISHED";
+            names.push(ev.name);
+            if terminal {
+                break;
+            }
+        }
+        assert_eq!(names.first().unwrap(), "RUN_STARTED");
+        assert_eq!(names.last().unwrap(), "RUN_FINISHED");
+    }
+
+    #[tokio::test]
+    async fn cancelled_run_finalizes_as_cancelled() {
+        let store = FakeStore::with_user("hello");
+        let sink = VecSink::default();
+        let provider = StubProvider::with_reply("hi there");
+        let mut p = params(false);
+        // Cancel up front: the loop bails at the first turn boundary.
+        p.cancel.cancel();
+
+        run_turn(&store, Arc::new(FakeExec), &provider, &sink, &p, &AllowAll)
+            .await
+            .unwrap();
+
+        assert_eq!(store.status(), "idle");
+        match sink.events().into_iter().last().unwrap() {
+            AguiEvent::RunFinished { outcome, .. } => {
+                assert!(matches!(outcome, RunOutcome::Cancelled));
+            }
+            other => panic!("expected RUN_FINISHED, got {other:?}"),
+        }
+    }
 
     #[tokio::test]
     async fn happy_text_path_event_order() {

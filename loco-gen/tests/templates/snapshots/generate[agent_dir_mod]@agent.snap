@@ -1,0 +1,51 @@
+---
+source: loco-gen/tests/templates/agent.rs
+expression: "fs::read_to_string(agents_path.join(\"support\").join(\"mod.rs\")).expect(\"support/mod.rs missing\")"
+---
+//! The `support` agent.
+
+pub mod hooks;
+pub mod tools;
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use loco_rs::agui::{Agent, AgentCtx, AgentHooks, Tools};
+use loco_rs::prelude::*;
+
+/// Base system prompt for this agent. Edit freely; conversation context items
+/// are appended by [`crate::agents::runtime::assemble_system`].
+const SYSTEM_PROMPT: &str = "You are support, a helpful assistant.";
+
+/// Default model. Overridden by `agui.provider.default_model` when set.
+const MODEL: &str = "anthropic/claude-sonnet-5";
+
+/// The `support` agent definition.
+pub struct SupportAgent;
+
+#[async_trait]
+impl Agent for SupportAgent {
+    fn name(&self) -> &str {
+        "support"
+    }
+
+    fn description(&self) -> &str {
+        "The support agent."
+    }
+
+    fn model(&self) -> String {
+        MODEL.to_string()
+    }
+
+    async fn system_prompt(&self, ctx: &AgentCtx<'_>) -> Result<String> {
+        crate::agents::runtime::assemble_system(ctx, SYSTEM_PROMPT).await
+    }
+
+    fn tools(&self) -> Tools {
+        tools::tools()
+    }
+
+    fn hooks(&self) -> Arc<dyn AgentHooks> {
+        Arc::new(hooks::SupportHooks)
+    }
+}

@@ -275,6 +275,8 @@ pub enum Component {
     },
     #[cfg(feature = "with-db")]
     Agent {
+        /// Name / id of the agent to scaffold.
+        name: String,
         /// Whether to include timestamps (`created_at`, `updated_at` columns)
         with_tz: bool,
     },
@@ -357,7 +359,7 @@ pub fn generate(rrgen: &RRgen, component: Component, appinfo: &AppInfo) -> Resul
             fields,
         } => migration::generate(rrgen, &name, with_tz, &fields, appinfo)?,
         #[cfg(feature = "with-db")]
-        Component::Agent { with_tz } => agent::generate(rrgen, with_tz, appinfo)?,
+        Component::Agent { name, with_tz } => agent::generate(rrgen, &name, with_tz, appinfo)?,
         Component::Controller {
             name,
             actions,

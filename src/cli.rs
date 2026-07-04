@@ -297,6 +297,9 @@ Scaffolds the `agents`, `agent_modes`, `conversations`, `messages`, \
 responses over the AG-UI protocol using `loco_rs::agui` (enable the `agui` \
 feature on loco-rs).", "Examples:".bold().underline()))]
     Agent {
+        /// Name / id of the agent to scaffold (e.g. `support`). The first run
+        /// also lays down the shared `src/agents/` module + migration.
+        name: String,
         /// Generate without timestamps (`created_at`, `updated_at` columns)
         #[arg(long, action)]
         without_tz: bool,
@@ -450,7 +453,8 @@ impl ComponentArg {
                 })
             }
             #[cfg(feature = "with-db")]
-            Self::Agent { without_tz } => Ok(loco_gen::Component::Agent {
+            Self::Agent { name, without_tz } => Ok(loco_gen::Component::Agent {
+                name,
                 with_tz: !without_tz,
             }),
             Self::Controller {
