@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, IntoActiveModel,
-    QueryFilter, Set,
+    ActiveModelTrait, ColumnTrait, Condition, DatabaseBackend, DatabaseConnection, EntityTrait,
+    IntoActiveModel, QueryFilter, Set,
 };
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -23,6 +23,7 @@ use super::context::{
 use super::entities::{artifacts, conversations, memories, messages, tool_calls};
 use super::provider::{history_from_parts, ChatMessage, ToolCallReq, Usage};
 use super::runtime::{ConversationStore, MessageRef, PendingToolCall, ToolRef};
+use super::scope::contains as scope_contains;
 use crate::{Error, Result};
 
 /// Persistence for a single conversation, keyed by its numeric id.
@@ -373,20 +374,45 @@ impl DbMemoryStore {
     }
 
     /// Rows visible to this store: tenant-scoped (or global `NULL` scope) memory,
-    /// plus this conversation's own memory.
+    /// plus this conversation's own memory. Tenant matching uses JSONB
+    /// containment on Postgres (see [`memory_visibility`]).
     fn visibility(&self) -> Condition {
-        let scope_cond = match &self.scope {
-            Some(s) => Condition::any()
-                .add(memories::Column::Scope.eq(s.clone()))
-                .add(memories::Column::Scope.is_null()),
-            None => Condition::all().add(memories::Column::Scope.is_null()),
-        };
-        match self.conversation_id {
-            Some(cid) => Condition::any()
-                .add(scope_cond)
-                .add(memories::Column::ConversationId.eq(cid)),
-            None => scope_cond,
+        let pg = self.db.get_database_backend() == DatabaseBackend::Postgres;
+        memory_visibility(self.scope.as_ref(), self.conversation_id, pg)
+    }
+}
+
+/// The `WHERE` condition selecting memory rows visible to a store scoped to
+/// `scope` (tenant) and optional `conversation_id`.
+///
+/// A row is visible when it is *tenant-scoped* (matches `scope`), *global*
+/// (`NULL` scope), or *owned by this conversation*. The tenant match is exact
+/// equality by default; on Postgres (`pg`) it uses JSONB containment
+/// (`scope @> ..`, via [`scope::contains`](super::scope::contains)) so a memory
+/// stamped with a *richer* scope (e.g. `{organization_id, project_id}`) is still
+/// visible to a coarser tenant query (`{organization_id}`) — mirroring the
+/// flexibility a [`ScopeResolver`](super::scope::ScopeResolver) gets for
+/// conversations. Containment is Postgres-only, so other backends keep exact
+/// equality.
+fn memory_visibility(scope: Option<&Value>, conversation_id: Option<i32>, pg: bool) -> Condition {
+    let scope_cond = match scope {
+        Some(s) => {
+            let tenant = if pg {
+                scope_contains(memories::Column::Scope, s)
+            } else {
+                Condition::all().add(memories::Column::Scope.eq(s.clone()))
+            };
+            Condition::any()
+                .add(tenant)
+                .add(memories::Column::Scope.is_null())
         }
+        None => Condition::all().add(memories::Column::Scope.is_null()),
+    };
+    match conversation_id {
+        Some(cid) => Condition::any()
+            .add(scope_cond)
+            .add(memories::Column::ConversationId.eq(cid)),
+        None => scope_cond,
     }
 }
 
@@ -544,6 +570,35 @@ mod tests {
             Some(parts),
             None
         )));
+    }
+
+    #[test]
+    fn memory_visibility_uses_containment_only_on_postgres() {
+        use sea_orm::{DatabaseBackend, EntityTrait, QueryFilter, QueryTrait};
+
+        let scope = json!({ "organization_id": 1 });
+
+        // Postgres: tenant match is JSONB containment, so a richer-scoped row is
+        // still visible to a coarser `{organization_id}` query.
+        let pg_sql = memories::Entity::find()
+            .filter(memory_visibility(Some(&scope), Some(7), true))
+            .build(DatabaseBackend::Postgres)
+            .to_string();
+        assert!(pg_sql.contains("@>"), "pg should use containment: {pg_sql}");
+        assert!(
+            pg_sql.contains("conversation_id"),
+            "conversation-owned rows stay reachable: {pg_sql}"
+        );
+
+        // Other backends keep exact equality (no `@>`).
+        let lite_sql = memories::Entity::find()
+            .filter(memory_visibility(Some(&scope), Some(7), false))
+            .build(DatabaseBackend::Sqlite)
+            .to_string();
+        assert!(
+            !lite_sql.contains("@>"),
+            "sqlite must not emit containment: {lite_sql}"
+        );
     }
 
     #[test]
