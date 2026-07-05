@@ -482,6 +482,7 @@ where
                     })
                     .unwrap_or_default();
                 Principal {
+                    subject: Some(jwt.claims.pid.clone()),
                     scopes,
                     claims: serde_json::to_value(&jwt.claims.claims).unwrap_or(Value::Null),
                 }

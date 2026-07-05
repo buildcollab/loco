@@ -151,8 +151,9 @@ pub async fn execute(
     let hooks = agent.hooks();
     let mut provider = service::provider(ctx, &agent.model());
     // Structured output: constrain the answer to the agent's response schema.
+    // A no-op on providers without structured output (e.g. the stub).
     if let Some(schema) = agent.response_schema(&actx) {
-        provider = provider.with_response_format(schema);
+        provider.set_response_format(schema);
     }
 
     let hub = run_hub(ctx);

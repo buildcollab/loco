@@ -251,6 +251,15 @@ pub trait Provider: Send + Sync {
         tools: &[ToolSpec],
         tx: &tokio::sync::mpsc::Sender<AgentDelta>,
     ) -> Result<TurnOutcome>;
+
+    /// Constrain this run's answer to a JSON schema (structured output), if the
+    /// backend supports it. Called by the run-loop when the agent declares a
+    /// [`response_schema`](crate::agui::agent::Agent::response_schema). The
+    /// default is a no-op so providers without structured output (e.g. the
+    /// [`StubProvider`]) simply ignore it — the `&mut self`/object-safe
+    /// counterpart to [`RigProvider::with_response_format`], usable through a
+    /// `Box<dyn Provider>`.
+    fn set_response_format(&mut self, _schema: Value) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -582,6 +591,9 @@ impl<T: ?Sized + Provider> Provider for Box<T> {
     ) -> Result<TurnOutcome> {
         (**self).stream_turn(system, history, tools, tx).await
     }
+    fn set_response_format(&mut self, schema: Value) {
+        (**self).set_response_format(schema);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -686,6 +698,9 @@ impl RigProvider {
                     .unwrap_or_else(|| OPENAI_BASE_URL.to_string()),
             ),
             ProviderConfig::OpenaiCompatible(_) => settings.base_url.clone(),
+            // `Stub` never reaches here — `service::provider` builds a
+            // `StubProvider` for it before constructing a `RigProvider`.
+            ProviderConfig::Stub(_) => settings.base_url.clone(),
         };
         Self::new(settings.api_key.clone(), base_url, model)
     }
@@ -745,10 +760,7 @@ impl RigProvider {
     /// `json_schema` response-format envelope. Builder style.
     #[must_use]
     pub fn with_response_format(mut self, schema: Value) -> Self {
-        self.config.response_format = Some(json!({
-            "type": "json_schema",
-            "json_schema": { "name": "response", "schema": schema, "strict": true }
-        }));
+        Provider::set_response_format(&mut self, schema);
         self
     }
 
@@ -858,6 +870,13 @@ impl RigProvider {
 impl Provider for RigProvider {
     fn model_id(&self) -> String {
         self.model.clone()
+    }
+
+    fn set_response_format(&mut self, schema: Value) {
+        self.config.response_format = Some(json!({
+            "type": "json_schema",
+            "json_schema": { "name": "response", "schema": schema, "strict": true }
+        }));
     }
 
     fn provider_name(&self) -> String {
@@ -1678,6 +1697,20 @@ mod tests {
         let body = structured.build_body("s", &[], &[]);
         assert_eq!(body["response_format"]["type"], "json_schema");
         assert_eq!(body["response_format"]["json_schema"]["strict"], json!(true));
+        assert_eq!(body["response_format"]["json_schema"]["schema"], schema);
+    }
+
+    #[test]
+    fn boxed_provider_forwards_set_response_format() {
+        // The run-loop holds the provider as a `Box<dyn Provider>` and calls
+        // `set_response_format` through it. The `Provider for Box<T>` blanket
+        // impl must forward to the inner provider, not fall back to the trait's
+        // default no-op — otherwise structured output silently breaks once the
+        // provider is boxed.
+        let schema = json!({ "type": "object" });
+        let mut boxed: Box<RigProvider> = Box::new(RigProvider::new("k", None, "m"));
+        Provider::set_response_format(&mut boxed, schema.clone());
+        let body = boxed.build_body("s", &[], &[]);
         assert_eq!(body["response_format"]["json_schema"]["schema"], schema);
     }
 

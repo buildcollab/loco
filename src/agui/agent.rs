@@ -34,6 +34,12 @@ use crate::{Error, Result};
 /// [worker job](crate::agui::worker) payload when a run is enqueued.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Principal {
+    /// The authenticated subject — the JWT `pid` (loco's user public id) when
+    /// extracted from a bearer token, else `None` (anonymous). This is the one
+    /// identity field lifted out of `claims` so an app can attribute a run to a
+    /// user without re-parsing the token or duplicating it into a custom claim.
+    #[serde(default)]
+    pub subject: Option<String>,
     /// Scopes/permissions the caller holds (e.g. from a JWT `scopes` claim).
     pub scopes: Vec<String>,
     /// Raw claims / app-defined context for richer policies.
@@ -271,5 +277,30 @@ impl AgentRegistry {
     #[must_use]
     pub fn all(&self) -> Vec<Arc<dyn Agent>> {
         self.agents.values().cloned().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Principal;
+    use serde_json::json;
+
+    #[test]
+    fn principal_subject_roundtrips_and_defaults() {
+        // A durable worker-job payload enqueued before `subject` existed omits
+        // the field; `#[serde(default)]` must still decode it (as `None`) so
+        // in-flight jobs survive the upgrade.
+        let legacy: Principal =
+            serde_json::from_value(json!({ "scopes": ["a"], "claims": {} })).unwrap();
+        assert_eq!(legacy.subject, None);
+        assert_eq!(legacy.scopes, vec!["a".to_string()]);
+
+        let p = Principal {
+            subject: Some("user-1".to_string()),
+            scopes: vec![],
+            claims: json!({}),
+        };
+        let back: Principal = serde_json::from_value(serde_json::to_value(&p).unwrap()).unwrap();
+        assert_eq!(back.subject.as_deref(), Some("user-1"));
     }
 }
