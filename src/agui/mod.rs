@@ -69,6 +69,7 @@
 pub mod agent;
 pub mod artifact;
 pub mod context;
+pub mod eval;
 pub mod guardrail;
 pub mod hub;
 pub mod interact;
@@ -110,6 +111,7 @@ pub use context::{
     Artifact, ArtifactStore, Embedder, MemoryHit, MemoryStore, NewArtifact, NewMemory, NoEmbedder,
     NoTokens, ToolContext, TokenResolver,
 };
+pub use eval::{run_case, run_suite, EvalCase, EvalOutcome};
 pub use guardrail::{BudgetLimiter, Guardrail, NoGuardrail, TokenBudget, Unlimited};
 pub use interact::builtin_interact_tools;
 pub use memory::builtin_memory_tools;
@@ -139,13 +141,13 @@ pub use worker::{
 // Re-exported so generated app code can build cancellation tokens / run hubs
 // without adding `tokio-util` as a direct dependency.
 pub use protocol::{
-    part_citation, part_text, part_thinking, part_tool_result, part_tool_use, AguiEvent, Interrupt,
-    ResumeItem, ResumePayload, RunAgentInput, RunOutcome,
+    part_citation, part_image, part_text, part_thinking, part_tool_result, part_tool_use,
+    AguiEvent, Interrupt, ResumeItem, ResumePayload, RunAgentInput, RunOutcome,
 };
 pub use provider::{
-    history_from_parts, AgentDelta, ChatMessage, Provider, RigConfig, RigProvider, StreamAssembler,
-    StubProvider, ToolCallReq, ToolKind, ToolSpec, TurnOutcome, Usage, OPENAI_BASE_URL,
-    OPENROUTER_BASE_URL,
+    history_from_parts, multimodal_content, AgentDelta, ChatMessage, Provider, RigConfig,
+    RigProvider, StreamAssembler, StubProvider, ToolCallReq, ToolKind, ToolSpec, TurnOutcome, Usage,
+    OPENAI_BASE_URL, OPENROUTER_BASE_URL,
 };
 pub use runtime::{
     resume, resume_with_subagents, run_turn, run_turn_with_subagents, AllowAll, ConversationStore,

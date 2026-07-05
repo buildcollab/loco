@@ -323,10 +323,41 @@ fn messages_to_json(system: &str, history: &[ChatMessage], cache_system: bool) -
                 "tool_calls": calls,
             }));
         } else {
-            out.push(json!({ "role": m.role, "content": m.content }));
+            // Multimodal pass-through: if the content is a JSON array (built by
+            // [`multimodal_content`]), forward it as structured content (text +
+            // image_url parts) for vision models; otherwise send plain text.
+            out.push(json!({ "role": m.role, "content": content_value(&m.content) }));
         }
     }
     out
+}
+
+/// Interpret a message's stored `content`: a JSON array (a multimodal payload)
+/// is forwarded as structured content; anything else is plain text.
+fn content_value(content: &str) -> Value {
+    if content.trim_start().starts_with('[') {
+        if let Ok(v @ Value::Array(_)) = serde_json::from_str::<Value>(content) {
+            return v;
+        }
+    }
+    Value::String(content.to_string())
+}
+
+/// Build an OpenAI-compatible multimodal user-message content payload (text plus
+/// one or more image URLs / data URLs), serialized as a JSON string. Store it as
+/// a user message's content and vision-capable models will see the images.
+///
+/// ```ignore
+/// let content = multimodal_content("What's in this chart?", &[data_url]);
+/// store.append_user_message(&content).await?; // vision turn
+/// ```
+#[must_use]
+pub fn multimodal_content(text: &str, image_urls: &[String]) -> String {
+    let mut parts = vec![json!({ "type": "text", "text": text })];
+    for url in image_urls {
+        parts.push(json!({ "type": "image_url", "image_url": { "url": url } }));
+    }
+    Value::Array(parts).to_string()
 }
 
 /// Incrementally assembles OpenAI-style streaming chunks into deltas + a final
@@ -1621,6 +1652,20 @@ mod tests {
             b1["messages"][0]["content"][0]["cache_control"]["type"],
             "ephemeral"
         );
+    }
+
+    #[test]
+    fn multimodal_content_forwards_as_structured() {
+        let content = multimodal_content("what is this?", &["data:image/png;base64,AAAA".into()]);
+        let hist = vec![ChatMessage::text("user", &content)];
+        let msgs = messages_to_json("", &hist, false);
+        // The user message content became a structured array (text + image_url).
+        assert!(msgs[0]["content"].is_array());
+        assert_eq!(msgs[0]["content"][0]["type"], "text");
+        assert_eq!(msgs[0]["content"][1]["type"], "image_url");
+        // Plain text still passes through as a string.
+        let plain = messages_to_json("", &[ChatMessage::text("user", "hello")], false);
+        assert_eq!(plain[0]["content"], json!("hello"));
     }
 
     #[test]

@@ -219,6 +219,12 @@ pub fn part_thinking(text: &str) -> Value {
     json!({ "type": "thinking", "text": text })
 }
 
+/// An "image" message part (a URL or data URL) — for multimodal/vision turns.
+#[must_use]
+pub fn part_image(url: &str) -> Value {
+    json!({ "type": "image", "url": url })
+}
+
 /// A "citation" message part linking an answer to a source (a memory/artifact id
 /// or URL) — provenance the UI can render inline.
 #[must_use]
