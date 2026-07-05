@@ -78,6 +78,7 @@ pub mod runtime;
 pub mod subagent;
 pub mod tool;
 pub mod transport;
+pub mod workflow;
 
 // DB-backed pieces (previously generated into every app): the framework-owned
 // entities, the `ConversationStore`, config-driven factories, the reusable HTTP
@@ -153,6 +154,7 @@ pub use subagent::{
 };
 pub use tokio_util::sync::CancellationToken;
 pub use tool::{NoArgs, Tool, Tools};
+pub use workflow::{LoopAgent, ParallelAgent, SequentialAgent, StopWhen};
 pub use transport::{
     event_to_sse, hub_event_to_sse, hub_sse_response, spawn_and_stream, sse_response, EventSink,
     MpscSink, NullSink,
