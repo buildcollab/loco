@@ -154,6 +154,13 @@ pub trait Agent: Send + Sync {
     /// Propagates any error while gathering prompt material (e.g. DB reads).
     async fn system_prompt(&self, ctx: &AgentCtx<'_>) -> Result<String>;
 
+    /// An optional JSON Schema constraining the model's final answer (structured
+    /// output). When set, the run sends it as the provider `response_format`, so
+    /// the agent returns a validated JSON object — ideal for report generation.
+    fn response_schema(&self, _ctx: &AgentCtx<'_>) -> Option<serde_json::Value> {
+        None
+    }
+
     /// The typed tools this agent exposes.
     fn tools(&self) -> Tools;
 

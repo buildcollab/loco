@@ -586,6 +586,9 @@ pub struct RigConfig {
     pub top_p: Option<f64>,
     /// Mark the system prompt as a cache breakpoint (Anthropic via OpenRouter).
     pub cache_system: bool,
+    /// OpenAI-compatible `response_format` (structured output). When set, sent on
+    /// every request so the model's answer conforms to the schema.
+    pub response_format: Option<Value>,
     /// Max retry attempts for transient failures (429 / 5xx / connect).
     pub max_retries: usize,
     /// Idle timeout between streamed chunks before aborting a stalled stream.
@@ -605,6 +608,7 @@ impl Default for RigConfig {
             max_tokens: None,
             top_p: None,
             cache_system: false,
+            response_format: None,
             max_retries: 2,
             idle_timeout: Duration::from_secs(60),
             request_timeout: Duration::from_secs(120),
@@ -699,6 +703,18 @@ impl RigProvider {
         self
     }
 
+    /// Constrain the model's answer to a JSON schema (OpenAI-compatible
+    /// structured output). `schema` is a JSON Schema object; it is wrapped in the
+    /// `json_schema` response-format envelope. Builder style.
+    #[must_use]
+    pub fn with_response_format(mut self, schema: Value) -> Self {
+        self.config.response_format = Some(json!({
+            "type": "json_schema",
+            "json_schema": { "name": "response", "schema": schema, "strict": true }
+        }));
+        self
+    }
+
     fn endpoint(&self) -> String {
         format!("{}/chat/completions", self.base_url.trim_end_matches('/'))
     }
@@ -720,6 +736,9 @@ impl RigProvider {
         }
         if let Some(p) = self.config.top_p {
             body["top_p"] = json!(p);
+        }
+        if let Some(rf) = &self.config.response_format {
+            body["response_format"] = rf.clone();
         }
         body
     }
@@ -1596,6 +1615,19 @@ mod tests {
             b1["messages"][0]["content"][0]["cache_control"]["type"],
             "ephemeral"
         );
+    }
+
+    #[test]
+    fn response_format_wraps_schema_when_set() {
+        let base = RigProvider::new("k", None, "m");
+        assert!(base.build_body("s", &[], &[]).get("response_format").is_none());
+
+        let schema = json!({ "type": "object", "properties": { "title": { "type": "string" } } });
+        let structured = RigProvider::new("k", None, "m").with_response_format(schema.clone());
+        let body = structured.build_body("s", &[], &[]);
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(body["response_format"]["json_schema"]["strict"], json!(true));
+        assert_eq!(body["response_format"]["json_schema"]["schema"], schema);
     }
 
     #[test]

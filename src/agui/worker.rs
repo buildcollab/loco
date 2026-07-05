@@ -144,7 +144,11 @@ pub async fn execute(
     let guardrail = agent.guardrail(&actx);
     let budget = agent.budget(&actx);
     let hooks = agent.hooks();
-    let provider = service::provider(ctx, &agent.model());
+    let mut provider = service::provider(ctx, &agent.model());
+    // Structured output: constrain the answer to the agent's response schema.
+    if let Some(schema) = agent.response_schema(&actx) {
+        provider = provider.with_response_format(schema);
+    }
 
     let hub = run_hub(ctx);
     let sink: Arc<HubSink> = Arc::new(HubSink::new(hub.clone(), args.run_id.clone()));
