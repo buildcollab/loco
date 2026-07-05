@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, IntoActiveModel,
-    QueryFilter, Set,
+    ActiveModelTrait, ColumnTrait, Condition, DatabaseBackend, DatabaseConnection, EntityTrait,
+    IntoActiveModel, QueryFilter, Set,
 };
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -23,6 +23,7 @@ use super::context::{
 use super::entities::{artifacts, conversations, memories, messages, tool_calls};
 use super::provider::{history_from_parts, ChatMessage, ToolCallReq, Usage};
 use super::runtime::{ConversationStore, MessageRef, PendingToolCall, ToolRef};
+use super::scope::contains as scope_contains;
 use crate::{Error, Result};
 
 /// Persistence for a single conversation, keyed by its numeric id.
@@ -31,6 +32,22 @@ pub struct DbStore {
     pub db: DatabaseConnection,
     /// The conversation this store reads and writes.
     pub conversation_id: i32,
+}
+
+/// Is `m` the current turn's not-yet-written assistant placeholder?
+///
+/// `run_turn` inserts a `"streaming"` assistant row before loading history, so
+/// this catches that row (empty `parts` *and* empty `content`) without dropping
+/// an interrupt-finalized `"streaming"` row, which always carries `parts`.
+fn is_empty_streaming(m: &messages::Model) -> bool {
+    let is_streaming = m.status.as_deref() == Some("streaming");
+    let has_parts = m
+        .parts
+        .as_ref()
+        .and_then(Value::as_array)
+        .is_some_and(|a| !a.is_empty());
+    let has_content = m.content.as_deref().is_some_and(|c| !c.is_empty());
+    is_streaming && !has_parts && !has_content
 }
 
 impl DbStore {
@@ -61,10 +78,18 @@ impl ConversationStore for DbStore {
             .all(&self.db)
             .await?;
         rows.sort_by_key(|m| m.id);
+        // `run_turn` inserts the assistant row (status `"streaming"`) *before*
+        // calling `load_history`, so the current turn's still-empty placeholder
+        // is present here. Replaying it would inject a spurious empty assistant
+        // turn into the provider prompt. Skip in-progress rows that carry no
+        // content yet, while keeping interrupt-finalized `"streaming"` rows —
+        // those already hold `parts` (e.g. a `tool_use`) that `resume` needs.
         // Lossless: rebuild tool_use / tool_result context from the persisted
         // `parts`, falling back to plain `content` for rows without parts.
         Ok(history_from_parts(
-            rows.into_iter().map(|m| (m.role, m.parts, m.content)),
+            rows.into_iter()
+                .filter(|m| !is_empty_streaming(m))
+                .map(|m| (m.role, m.parts, m.content)),
         ))
     }
 
@@ -349,20 +374,45 @@ impl DbMemoryStore {
     }
 
     /// Rows visible to this store: tenant-scoped (or global `NULL` scope) memory,
-    /// plus this conversation's own memory.
+    /// plus this conversation's own memory. Tenant matching uses JSONB
+    /// containment on Postgres (see [`memory_visibility`]).
     fn visibility(&self) -> Condition {
-        let scope_cond = match &self.scope {
-            Some(s) => Condition::any()
-                .add(memories::Column::Scope.eq(s.clone()))
-                .add(memories::Column::Scope.is_null()),
-            None => Condition::all().add(memories::Column::Scope.is_null()),
-        };
-        match self.conversation_id {
-            Some(cid) => Condition::any()
-                .add(scope_cond)
-                .add(memories::Column::ConversationId.eq(cid)),
-            None => scope_cond,
+        let pg = self.db.get_database_backend() == DatabaseBackend::Postgres;
+        memory_visibility(self.scope.as_ref(), self.conversation_id, pg)
+    }
+}
+
+/// The `WHERE` condition selecting memory rows visible to a store scoped to
+/// `scope` (tenant) and optional `conversation_id`.
+///
+/// A row is visible when it is *tenant-scoped* (matches `scope`), *global*
+/// (`NULL` scope), or *owned by this conversation*. The tenant match is exact
+/// equality by default; on Postgres (`pg`) it uses JSONB containment
+/// (`scope @> ..`, via [`scope::contains`](super::scope::contains)) so a memory
+/// stamped with a *richer* scope (e.g. `{organization_id, project_id}`) is still
+/// visible to a coarser tenant query (`{organization_id}`) — mirroring the
+/// flexibility a [`ScopeResolver`](super::scope::ScopeResolver) gets for
+/// conversations. Containment is Postgres-only, so other backends keep exact
+/// equality.
+fn memory_visibility(scope: Option<&Value>, conversation_id: Option<i32>, pg: bool) -> Condition {
+    let scope_cond = match scope {
+        Some(s) => {
+            let tenant = if pg {
+                scope_contains(memories::Column::Scope, s)
+            } else {
+                Condition::all().add(memories::Column::Scope.eq(s.clone()))
+            };
+            Condition::any()
+                .add(tenant)
+                .add(memories::Column::Scope.is_null())
         }
+        None => Condition::all().add(memories::Column::Scope.is_null()),
+    };
+    match conversation_id {
+        Some(cid) => Condition::any()
+            .add(scope_cond)
+            .add(memories::Column::ConversationId.eq(cid)),
+        None => scope_cond,
     }
 }
 
@@ -473,5 +523,96 @@ impl MemoryStore for DbMemoryStore {
         scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(top_k.max(1));
         Ok(scored)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg(role: &str, status: Option<&str>, parts: Option<Value>, content: Option<&str>) -> messages::Model {
+        messages::Model {
+            id: 1,
+            pid: Uuid::nil(),
+            conversation_id: 1,
+            role: role.to_string(),
+            content: content.map(str::to_string),
+            parts,
+            provider: None,
+            model: None,
+            usage: None,
+            status: status.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn skips_the_fresh_streaming_placeholder() {
+        // `run_turn` inserts this (status "streaming", no parts, no content)
+        // before `load_history`; replaying it injects an empty assistant turn.
+        assert!(is_empty_streaming(&msg("assistant", Some("streaming"), None, None)));
+        // An empty `parts` array is just as empty as a missing one.
+        assert!(is_empty_streaming(&msg(
+            "assistant",
+            Some("streaming"),
+            Some(json!([])),
+            None
+        )));
+    }
+
+    #[test]
+    fn keeps_interrupt_finalized_streaming_row() {
+        // The approval/interrupt path finalizes the assistant row as still
+        // "streaming" but with real `parts` (a tool_use `resume` must replay).
+        let parts = json!([{ "type": "tool_use", "toolCallId": "c1", "name": "x", "input": {} }]);
+        assert!(!is_empty_streaming(&msg(
+            "assistant",
+            Some("streaming"),
+            Some(parts),
+            None
+        )));
+    }
+
+    #[test]
+    fn memory_visibility_uses_containment_only_on_postgres() {
+        use sea_orm::{DatabaseBackend, EntityTrait, QueryFilter, QueryTrait};
+
+        let scope = json!({ "organization_id": 1 });
+
+        // Postgres: tenant match is JSONB containment, so a richer-scoped row is
+        // still visible to a coarser `{organization_id}` query.
+        let pg_sql = memories::Entity::find()
+            .filter(memory_visibility(Some(&scope), Some(7), true))
+            .build(DatabaseBackend::Postgres)
+            .to_string();
+        assert!(pg_sql.contains("@>"), "pg should use containment: {pg_sql}");
+        assert!(
+            pg_sql.contains("conversation_id"),
+            "conversation-owned rows stay reachable: {pg_sql}"
+        );
+
+        // Other backends keep exact equality (no `@>`).
+        let lite_sql = memories::Entity::find()
+            .filter(memory_visibility(Some(&scope), Some(7), false))
+            .build(DatabaseBackend::Sqlite)
+            .to_string();
+        assert!(
+            !lite_sql.contains("@>"),
+            "sqlite must not emit containment: {lite_sql}"
+        );
+    }
+
+    #[test]
+    fn keeps_completed_and_empty_rows() {
+        // Completed rows are never touched, even when empty (a model that
+        // genuinely returned nothing).
+        assert!(!is_empty_streaming(&msg("assistant", Some("complete"), None, Some(""))));
+        assert!(!is_empty_streaming(&msg("user", Some("complete"), None, Some("hi"))));
+        // A streaming row that already streamed some text stays.
+        assert!(!is_empty_streaming(&msg(
+            "assistant",
+            Some("streaming"),
+            None,
+            Some("partial")
+        )));
     }
 }
