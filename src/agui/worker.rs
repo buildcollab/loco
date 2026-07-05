@@ -44,14 +44,15 @@ use uuid::Uuid;
 
 use super::agent::{AgentCtx, AgentRegistry, Principal};
 use super::artifact::builtin_artifact_tools;
-use super::context::ArtifactStore;
+use super::context::{ArtifactStore, MemoryStore};
 use super::context_tool::builtin_context_tools;
 use super::entities::conversations;
 use super::hub::{run_hub, HubSink};
+use super::memory::builtin_memory_tools;
 use super::protocol::RunAgentInput;
 use super::runtime::{resume, run_turn, ConversationStore, RunParams};
 use super::service;
-use super::store::{DbArtifactStore, DbStore};
+use super::store::{DbArtifactStore, DbMemoryStore, DbStore};
 use super::subagent::CompositeToolExecutor;
 use crate::app::AppContext;
 use crate::bgworker::BackgroundWorker;
@@ -137,6 +138,7 @@ pub async fn execute(
     let system = agent.system_prompt(&actx).await?;
     let authz = agent.authorizer(&actx);
     let tokens = agent.token_resolver(&actx);
+    let embedder = agent.embedder(&actx);
     let hooks = agent.hooks();
     let provider = service::provider(ctx, &agent.model());
 
@@ -148,19 +150,27 @@ pub async fn execute(
     // artifact store.
     let artifacts: Arc<dyn ArtifactStore> =
         Arc::new(DbArtifactStore::new(ctx.db.clone(), conversation.id));
+    let memory: Arc<dyn MemoryStore> = Arc::new(DbMemoryStore::new(
+        ctx.db.clone(),
+        conversation.scope.clone(),
+        Some(conversation.id),
+        embedder,
+    ));
     let tool_ctx = actx
         .tool_context(args.run_id.clone())
         .with_tokens(tokens)
         .with_sink(sink.clone())
-        .with_artifacts(artifacts);
+        .with_artifacts(artifacts)
+        .with_memory(memory);
 
-    // The agent's own tools plus the framework's built-in artifact tools. App
-    // tools win on any name collision (first-registered wins).
+    // The agent's own tools plus the framework's built-in artifact / context /
+    // memory tools. App tools win on any name collision (first-registered wins).
     let tools = Arc::new(
         CompositeToolExecutor::default()
             .with(agent.tools())
             .with(builtin_artifact_tools())
-            .with(builtin_context_tools()),
+            .with(builtin_context_tools())
+            .with(builtin_memory_tools()),
     );
 
     let params = RunParams {

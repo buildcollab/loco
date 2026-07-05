@@ -19,7 +19,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::agui::context::{NoTokens, TokenResolver};
+use crate::agui::context::{Embedder, NoEmbedder, NoTokens, TokenResolver};
 use crate::agui::provider::{ToolCallReq, TurnOutcome};
 use crate::agui::runtime::{AllowAll, ToolAuthorizer};
 use crate::agui::tool::Tools;
@@ -173,6 +173,13 @@ pub trait Agent: Send + Sync {
     /// replaying a captured (expired) one.
     fn token_resolver(&self, _ctx: &AgentCtx<'_>) -> Arc<dyn TokenResolver> {
         Arc::new(NoTokens)
+    }
+
+    /// The embedder backing this agent's long-term memory search (defaults to
+    /// [`NoEmbedder`], i.e. lexical ranking). Return an embedder that calls your
+    /// embedding model to enable semantic (cosine) retrieval.
+    fn embedder(&self, _ctx: &AgentCtx<'_>) -> Arc<dyn Embedder> {
+        Arc::new(NoEmbedder)
     }
 
     /// App-defined custom dependencies to place on the run's

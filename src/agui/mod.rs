@@ -70,6 +70,7 @@ pub mod agent;
 pub mod artifact;
 pub mod context;
 pub mod hub;
+pub mod memory;
 pub mod protocol;
 pub mod provider;
 pub mod runtime;
@@ -99,8 +100,10 @@ pub mod worker;
 pub use agent::{Agent, AgentCtx, AgentHooks, AgentRegistry, NoopHooks, Principal, RunCtx};
 pub use artifact::builtin_artifact_tools;
 pub use context::{
-    Artifact, ArtifactStore, NewArtifact, NoTokens, ToolContext, TokenResolver,
+    Artifact, ArtifactStore, Embedder, MemoryHit, MemoryStore, NewArtifact, NewMemory, NoEmbedder,
+    NoTokens, ToolContext, TokenResolver,
 };
+pub use memory::builtin_memory_tools;
 pub use hub::{
     channel_stream, in_memory, HubEvent, HubEventStream, HubSink, InMemoryRunHub, RunHandle,
     RunHub, DEFAULT_BUFFER_CAP,
@@ -117,7 +120,7 @@ pub use service::{
     provider as config_provider, set_active_run,
 };
 #[cfg(feature = "with-db")]
-pub use store::{DbArtifactStore, DbStore};
+pub use store::{DbArtifactStore, DbMemoryStore, DbStore};
 #[cfg(feature = "with-db")]
 pub use worker::{
     dispatch_run, execute, spawn_inline, start_run, RunAgentJob, RunArgs, StartedRun,

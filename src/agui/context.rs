@@ -105,6 +105,67 @@ pub struct NewArtifact {
     pub metadata: Option<Value>,
 }
 
+/// Turns text into embedding vectors for semantic memory search. Supplied
+/// per-agent by [`Agent::embedder`](crate::agui::agent::Agent::embedder) and used
+/// by a [`MemoryStore`]. The default [`NoEmbedder`] returns no vectors, so the
+/// store falls back to lexical ranking.
+#[async_trait]
+pub trait Embedder: Send + Sync {
+    /// Embed each input string; returns one vector per input (or an empty `Vec`
+    /// to signal "no embeddings — use lexical fallback").
+    ///
+    /// # Errors
+    /// Fails when the embedding backend is unreachable.
+    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
+}
+
+/// An [`Embedder`] that produces no vectors — the default. Memory search then
+/// ranks by lexical token overlap instead of cosine similarity.
+pub struct NoEmbedder;
+
+#[async_trait]
+impl Embedder for NoEmbedder {
+    async fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        Ok(Vec::new())
+    }
+}
+
+/// A new memory to persist (a fact, a summary, a retrieved document chunk).
+#[derive(Debug, Clone, Default)]
+pub struct NewMemory {
+    pub content: String,
+    pub kind: Option<String>,
+    pub metadata: Option<Value>,
+}
+
+/// A memory search result, ranked by relevance to the query.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryHit {
+    pub id: String,
+    pub content: String,
+    pub score: f32,
+    pub kind: Option<String>,
+    pub metadata: Option<Value>,
+}
+
+/// Long-term, retrievable memory for an agent — the RAG surface. Scoped by
+/// tenant/conversation at construction; the framework provides a DB-backed
+/// implementation
+/// ([`DbMemoryStore`](crate::agui::store::DbMemoryStore)) that embeds on write
+/// (when an [`Embedder`] is configured) and ranks on read by cosine similarity,
+/// falling back to lexical overlap. Reached by memory
+/// [`Tool`](crate::agui::tool::Tool)s through [`ToolContext::memory`].
+#[async_trait]
+pub trait MemoryStore: Send + Sync {
+    /// Persist memories (embedding them if an embedder is configured). Returns
+    /// how many were stored.
+    async fn add(&self, items: Vec<NewMemory>) -> Result<usize>;
+
+    /// Retrieve the `top_k` memories most relevant to `query`.
+    async fn search(&self, query: &str, top_k: usize) -> Result<Vec<MemoryHit>>;
+}
+
 /// Persistence for a conversation's [`Artifact`]s. Reached by artifact
 /// [`Tool`](crate::agui::tool::Tool)s through [`ToolContext::artifacts`]; the
 /// framework provides a DB-backed implementation
@@ -159,6 +220,7 @@ pub struct ToolContext {
     tokens: Option<Arc<dyn TokenResolver>>,
     sink: Option<Arc<dyn EventSink>>,
     artifacts: Option<Arc<dyn ArtifactStore>>,
+    memory: Option<Arc<dyn MemoryStore>>,
     extensions: Option<Arc<dyn Any + Send + Sync>>,
 }
 
@@ -185,6 +247,12 @@ impl ToolContext {
     #[must_use]
     pub fn artifacts(&self) -> Option<Arc<dyn ArtifactStore>> {
         self.artifacts.clone()
+    }
+
+    /// The agent's long-term memory store (RAG), if configured.
+    #[must_use]
+    pub fn memory(&self) -> Option<Arc<dyn MemoryStore>> {
+        self.memory.clone()
     }
 
     /// Downcast the app-supplied custom deps to `T` (the type an
@@ -214,6 +282,13 @@ impl ToolContext {
         self.artifacts = Some(artifacts);
         self
     }
+
+    /// Attach the agent's memory store. Builder style.
+    #[must_use]
+    pub fn with_memory(mut self, memory: Arc<dyn MemoryStore>) -> Self {
+        self.memory = Some(memory);
+        self
+    }
 }
 
 impl AgentCtx<'_> {
@@ -234,6 +309,7 @@ impl AgentCtx<'_> {
             tokens: None,
             sink: None,
             artifacts: None,
+            memory: None,
         }
     }
 }

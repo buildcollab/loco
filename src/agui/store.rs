@@ -7,16 +7,20 @@
 //! an app only needs the tables (via the generated migration) and this store is
 //! constructed for it by the framework controller.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel, QueryFilter,
-    Set,
+    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, IntoActiveModel,
+    QueryFilter, Set,
 };
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use super::context::{Artifact, ArtifactStore, NewArtifact};
-use super::entities::{artifacts, conversations, messages, tool_calls};
+use super::context::{
+    Artifact, ArtifactStore, Embedder, MemoryHit, MemoryStore, NewArtifact, NewMemory,
+};
+use super::entities::{artifacts, conversations, memories, messages, tool_calls};
 use super::provider::{history_from_parts, ChatMessage, ToolCallReq, Usage};
 use super::runtime::{ConversationStore, MessageRef, PendingToolCall, ToolRef};
 use crate::{Error, Result};
@@ -308,5 +312,166 @@ impl ArtifactStore for DbArtifactStore {
             })
             .map(to_artifact)
             .collect())
+    }
+}
+
+/// [`MemoryStore`](super::context::MemoryStore) over the `memories` table,
+/// scoped to a tenant (and optionally a conversation). Embeds content on write
+/// when an [`Embedder`] is configured; ranks search by cosine similarity, or by
+/// lexical token overlap when no embeddings exist. Candidate rows are ranked
+/// in-process (portable across databases) — swap for a pgvector query when scale
+/// demands it.
+pub struct DbMemoryStore {
+    db: DatabaseConnection,
+    scope: Option<Value>,
+    conversation_id: Option<i32>,
+    embedder: Arc<dyn Embedder>,
+    /// Safety cap on candidate rows loaded for in-process ranking.
+    candidate_cap: u64,
+}
+
+impl DbMemoryStore {
+    /// Build a memory store for `scope` (tenant) and optional `conversation_id`.
+    #[must_use]
+    pub fn new(
+        db: DatabaseConnection,
+        scope: Option<Value>,
+        conversation_id: Option<i32>,
+        embedder: Arc<dyn Embedder>,
+    ) -> Self {
+        Self {
+            db,
+            scope,
+            conversation_id,
+            embedder,
+            candidate_cap: 1000,
+        }
+    }
+
+    /// Rows visible to this store: tenant-scoped (or global `NULL` scope) memory,
+    /// plus this conversation's own memory.
+    fn visibility(&self) -> Condition {
+        let scope_cond = match &self.scope {
+            Some(s) => Condition::any()
+                .add(memories::Column::Scope.eq(s.clone()))
+                .add(memories::Column::Scope.is_null()),
+            None => Condition::all().add(memories::Column::Scope.is_null()),
+        };
+        match self.conversation_id {
+            Some(cid) => Condition::any()
+                .add(scope_cond)
+                .add(memories::Column::ConversationId.eq(cid)),
+            None => scope_cond,
+        }
+    }
+}
+
+/// Cosine similarity of two equal-length vectors (0 if degenerate).
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let (mut dot, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+    if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        dot / (na.sqrt() * nb.sqrt())
+    }
+}
+
+/// Lexical fallback: fraction of the query's distinct lowercased tokens that
+/// appear in `text` (0..=1).
+fn lexical_score(query: &str, text: &str) -> f32 {
+    let qtokens: std::collections::BTreeSet<String> = query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() > 2)
+        .map(str::to_lowercase)
+        .collect();
+    if qtokens.is_empty() {
+        return 0.0;
+    }
+    let lower = text.to_lowercase();
+    let hits = qtokens.iter().filter(|t| lower.contains(*t)).count();
+    hits as f32 / qtokens.len() as f32
+}
+
+fn embedding_from_json(v: &Option<Value>) -> Option<Vec<f32>> {
+    v.as_ref().and_then(Value::as_array).map(|a| {
+        a.iter()
+            .filter_map(|x| x.as_f64().map(|f| f as f32))
+            .collect()
+    })
+}
+
+#[async_trait]
+impl MemoryStore for DbMemoryStore {
+    async fn add(&self, items: Vec<NewMemory>) -> Result<usize> {
+        if items.is_empty() {
+            return Ok(0);
+        }
+        let texts: Vec<String> = items.iter().map(|i| i.content.clone()).collect();
+        // Best-effort embedding: if it fails or is empty, store without vectors.
+        let embeds = self.embedder.embed(&texts).await.unwrap_or_default();
+        let mut count = 0;
+        for (i, item) in items.into_iter().enumerate() {
+            let embedding = embeds.get(i).map(|v| json!(v));
+            let row = memories::ActiveModel {
+                pid: Set(Uuid::new_v4()),
+                scope: Set(self.scope.clone()),
+                conversation_id: Set(self.conversation_id),
+                kind: Set(item.kind),
+                content: Set(item.content),
+                embedding: Set(embedding),
+                metadata: Set(item.metadata),
+                ..Default::default()
+            };
+            row.insert(&self.db).await?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    async fn search(&self, query: &str, top_k: usize) -> Result<Vec<MemoryHit>> {
+        use sea_orm::QuerySelect;
+        let rows = memories::Entity::find()
+            .filter(self.visibility())
+            .limit(self.candidate_cap)
+            .all(&self.db)
+            .await?;
+
+        // Embed the query once (empty vec → lexical fallback).
+        let qemb = self
+            .embedder
+            .embed(&[query.to_string()])
+            .await
+            .ok()
+            .and_then(|mut v| v.pop())
+            .filter(|v| !v.is_empty());
+
+        let mut scored: Vec<MemoryHit> = rows
+            .into_iter()
+            .map(|r| {
+                let score = match (&qemb, embedding_from_json(&r.embedding)) {
+                    (Some(q), Some(e)) if !e.is_empty() => cosine(q, &e),
+                    _ => lexical_score(query, &r.content),
+                };
+                MemoryHit {
+                    id: r.pid.to_string(),
+                    content: r.content,
+                    score,
+                    kind: r.kind,
+                    metadata: r.metadata,
+                }
+            })
+            .filter(|h| h.score > 0.0)
+            .collect();
+        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(top_k.max(1));
+        Ok(scored)
     }
 }

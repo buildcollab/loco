@@ -124,6 +124,26 @@ impl MigrationTrait for Migration {
         )
         .await?;
 
+        // Memories: long-term, retrievable knowledge (RAG). Tenant-scoped via
+        // `scope` (or global when NULL) and optionally tied to a conversation.
+        // `embedding` is a JSON array of floats when an embedder is configured.
+        create_table(
+            m,
+            "memories",
+            &[
+                ("id", ColType::PkAuto),
+                ("pid", ColType::UuidUniq),
+                ("scope", ColType::JsonBinaryNull),
+                ("conversation_id", ColType::IntegerNull),
+                ("kind", ColType::StringNull),
+                ("content", ColType::Text),
+                ("embedding", ColType::JsonBinaryNull),
+                ("metadata", ColType::JsonBinaryNull),
+            ],
+            &[],
+        )
+        .await?;
+
         // Run registry (multi-node run hub): one row per run. The owning node
         // polls `cancel_requested` to stop a run; `last_seq` is the newest event
         // sequence number.
@@ -166,6 +186,7 @@ impl MigrationTrait for Migration {
     async fn down(&self, m: &SchemaManager) -> Result<(), DbErr> {
         drop_table(m, "agent_events").await?;
         drop_table(m, "agent_runs").await?;
+        drop_table(m, "memories").await?;
         drop_table(m, "artifacts").await?;
         drop_table(m, "context_items").await?;
         drop_table(m, "tool_calls").await?;
