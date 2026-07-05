@@ -15,29 +15,43 @@ use uuid::Uuid;
 
 use super::agent::AgentCtx;
 use super::entities::{context_items, conversations};
-use super::provider::RigProvider;
+use super::provider::{Provider, RigProvider, StubProvider};
 use crate::app::AppContext;
+use crate::config::ProviderConfig;
 use crate::{Error, Result};
 
 /// Build the LLM provider from `agui.provider` config, defaulting the model to
 /// `default_model` (usually the agent's declared model) when config does not
 /// override it.
 ///
+/// Returns a boxed [`Provider`] so the concrete backend (real
+/// [`RigProvider`] or the network-free [`StubProvider`], selected by
+/// `agui.provider.kind`) is a config decision, not a compile-time one — a test
+/// or local-dev config can set `kind: stub` to drive the exact production
+/// run-loop with no API key or network.
+///
 /// With no `agui` config, returns an empty-key provider that will fail on first
 /// call — configure `agui.provider` in `config/*.yaml`.
 #[must_use]
-pub fn provider(ctx: &AppContext, default_model: &str) -> RigProvider {
+pub fn provider(ctx: &AppContext, default_model: &str) -> Box<dyn Provider> {
     match ctx.config.agui.as_ref() {
         Some(cfg) => {
+            if matches!(cfg.provider, ProviderConfig::Stub(_)) {
+                return Box::new(StubProvider::new());
+            }
             let model = cfg
                 .provider
                 .settings()
                 .default_model
                 .clone()
                 .unwrap_or_else(|| default_model.to_string());
-            RigProvider::from_config(&cfg.provider, model)
+            Box::new(RigProvider::from_config(&cfg.provider, model))
         }
-        None => RigProvider::new(String::new(), None, default_model.to_string()),
+        None => Box::new(RigProvider::new(
+            String::new(),
+            None,
+            default_model.to_string(),
+        )),
     }
 }
 

@@ -544,6 +544,12 @@ pub enum ProviderConfig {
     Openai(ProviderSettings),
     /// Any OpenAI-compatible endpoint; `base_url` is required.
     OpenaiCompatible(ProviderSettings),
+    /// Deterministic, network-free stub
+    /// ([`StubProvider`](crate::agui::provider::StubProvider)) for tests and
+    /// local dev. Settings other than `default_model` are ignored (no key or
+    /// base URL is used); the stub answers from canned text or a single write
+    /// tool-call.
+    Stub(ProviderSettings),
 }
 
 /// Shared provider credentials/tunables.
@@ -566,7 +572,10 @@ impl ProviderConfig {
     #[must_use]
     pub fn settings(&self) -> &ProviderSettings {
         match self {
-            Self::Openrouter(s) | Self::Openai(s) | Self::OpenaiCompatible(s) => s,
+            Self::Openrouter(s)
+            | Self::Openai(s)
+            | Self::OpenaiCompatible(s)
+            | Self::Stub(s) => s,
         }
     }
 }
@@ -865,5 +874,20 @@ impl std::fmt::Display for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let content = serde_yaml::to_string(self).unwrap_or_default();
         write!(f, "{content}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_config_stub_deserializes() {
+        // `kind: stub` selects the network-free provider; `default_model` still
+        // flows through `settings()`, other fields are optional.
+        let cfg: ProviderConfig =
+            serde_yaml::from_str("kind: stub\ndefault_model: test-model\n").unwrap();
+        assert!(matches!(cfg, ProviderConfig::Stub(_)));
+        assert_eq!(cfg.settings().default_model.as_deref(), Some("test-model"));
     }
 }
