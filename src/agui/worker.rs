@@ -141,6 +141,8 @@ pub async fn execute(
     let authz = agent.authorizer(&actx);
     let tokens = agent.token_resolver(&actx);
     let embedder = agent.embedder(&actx);
+    let guardrail = agent.guardrail(&actx);
+    let budget = agent.budget(&actx);
     let hooks = agent.hooks();
     let provider = service::provider(ctx, &agent.model());
 
@@ -194,6 +196,8 @@ pub async fn execute(
         tool_timeout: None,
         hooks,
         tool_ctx,
+        guardrail,
+        budget,
         cancel,
     };
 

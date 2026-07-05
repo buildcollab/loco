@@ -43,6 +43,7 @@ use tracing::{debug, error, info, instrument, warn};
 
 use crate::agui::agent::{AgentHooks, NoopHooks, RunCtx};
 use crate::agui::context::ToolContext;
+use crate::agui::guardrail::{BudgetLimiter, Guardrail, NoGuardrail, Unlimited};
 use crate::agui::protocol::{
     part_text, part_tool_result, part_tool_use, AguiEvent, Interrupt, ResumeItem, RunOutcome,
 };
@@ -255,6 +256,13 @@ pub struct RunParams {
     /// resolver, artifact store, custom deps). Cloned into each tool's task.
     /// Defaults to a detached context (no app) for subagent / test runs.
     pub tool_ctx: ToolContext,
+    /// Inspect/rewrite model input & output, or block the run. Defaults to a
+    /// no-op. Applied before each turn (system + history) and after a final
+    /// answer (text).
+    pub guardrail: Arc<dyn Guardrail>,
+    /// Per-turn spend cap keyed on `tool_ctx.scope` + accumulated usage. Defaults
+    /// to unlimited.
+    pub budget: Arc<dyn BudgetLimiter>,
     /// Cooperative cancellation for an explicit "stop". The loop polls this
     /// between turns and around tool calls, and races it during streaming; on
     /// cancel it persists partial output and finalizes as `"cancelled"`.
@@ -273,6 +281,8 @@ impl Default for RunParams {
             tool_timeout: None,
             hooks: Arc::new(NoopHooks),
             tool_ctx: ToolContext::default(),
+            guardrail: Arc::new(NoGuardrail),
+            budget: Arc::new(Unlimited),
             cancel: CancellationToken::new(),
         }
     }
@@ -928,17 +938,27 @@ where
     K: EventSink,
     A: ToolAuthorizer,
 {
+    // The guardrail may rewrite the system prompt, so work on a local copy.
+    let mut system = params.system.clone();
     for _turn in 0..params.max_tool_turns.max(1) {
         // Cancellation is cooperative: bail out at each turn boundary.
         if params.cancel.is_cancelled() {
             return Ok(LoopResult::Cancelled);
         }
 
+        // Budget check + input guardrail before spending a provider turn. Both
+        // may abort the run with an `Err` (surfaced as `RUN_ERROR`).
+        params
+            .budget
+            .check(params.tool_ctx.scope.as_ref(), total_usage)
+            .await?;
+        params.guardrail.on_input(&mut system, history).await?;
+
         params.hooks.before_message(ctx).await?;
         let outcome = match stream_one_turn(
             provider,
             sink,
-            &params.system,
+            &system,
             &msg.id,
             history,
             specs,
@@ -958,8 +978,11 @@ where
         params.hooks.after_message(ctx, &outcome).await?;
 
         match outcome {
-            TurnOutcome::Final { text, usage } => {
+            TurnOutcome::Final { mut text, usage } => {
                 total_usage.add(&usage);
+                // Output guardrail: moderate/redact the final answer before it is
+                // persisted (streamed deltas already went out live).
+                params.guardrail.on_output(&mut text).await?;
                 if !text.is_empty() {
                     parts.push(part_text(&text));
                 }

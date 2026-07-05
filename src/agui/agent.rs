@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::agui::context::{Embedder, NoEmbedder, NoTokens, TokenResolver};
+use crate::agui::guardrail::{BudgetLimiter, Guardrail, NoGuardrail, Unlimited};
 use crate::agui::provider::{ToolCallReq, TurnOutcome};
 use crate::agui::runtime::{AllowAll, ToolAuthorizer};
 use crate::agui::tool::Tools;
@@ -180,6 +181,18 @@ pub trait Agent: Send + Sync {
     /// embedding model to enable semantic (cosine) retrieval.
     fn embedder(&self, _ctx: &AgentCtx<'_>) -> Arc<dyn Embedder> {
         Arc::new(NoEmbedder)
+    }
+
+    /// The guardrail applied around each turn — inspect/rewrite the model input
+    /// and output, or block the run (defaults to a no-op [`NoGuardrail`]).
+    fn guardrail(&self, _ctx: &AgentCtx<'_>) -> Arc<dyn Guardrail> {
+        Arc::new(NoGuardrail)
+    }
+
+    /// The per-turn budget limiter (defaults to [`Unlimited`]). Cap spend per
+    /// tenant/run using the run's scope + accumulated usage.
+    fn budget(&self, _ctx: &AgentCtx<'_>) -> Arc<dyn BudgetLimiter> {
+        Arc::new(Unlimited)
     }
 
     /// App-defined custom dependencies to place on the run's

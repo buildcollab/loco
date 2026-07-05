@@ -69,6 +69,7 @@
 pub mod agent;
 pub mod artifact;
 pub mod context;
+pub mod guardrail;
 pub mod hub;
 pub mod memory;
 pub mod protocol;
@@ -105,6 +106,7 @@ pub use context::{
     Artifact, ArtifactStore, Embedder, MemoryHit, MemoryStore, NewArtifact, NewMemory, NoEmbedder,
     NoTokens, ToolContext, TokenResolver,
 };
+pub use guardrail::{BudgetLimiter, Guardrail, NoGuardrail, TokenBudget, Unlimited};
 pub use memory::builtin_memory_tools;
 pub use hub::{
     channel_stream, in_memory, HubEvent, HubEventStream, HubSink, InMemoryRunHub, RunHandle,
