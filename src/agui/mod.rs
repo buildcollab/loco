@@ -86,6 +86,8 @@ pub mod context_tool;
 #[cfg(feature = "with-db")]
 pub mod controller;
 #[cfg(feature = "with-db")]
+pub mod state_tool;
+#[cfg(feature = "with-db")]
 pub mod entities;
 #[cfg(feature = "with-db")]
 pub mod scope;
@@ -112,6 +114,8 @@ pub use hub::{
 pub use hub::{run_hub, DbRunHub};
 #[cfg(feature = "with-db")]
 pub use context_tool::builtin_context_tools;
+#[cfg(feature = "with-db")]
+pub use state_tool::builtin_state_tools;
 #[cfg(feature = "with-db")]
 pub use scope::{NoScope, ScopeResolver};
 #[cfg(feature = "with-db")]

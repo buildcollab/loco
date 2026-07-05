@@ -49,7 +49,9 @@ use super::context_tool::builtin_context_tools;
 use super::entities::conversations;
 use super::hub::{run_hub, HubSink};
 use super::memory::builtin_memory_tools;
-use super::protocol::RunAgentInput;
+use super::protocol::{AguiEvent, RunAgentInput};
+use super::state_tool::builtin_state_tools;
+use super::transport::EventSink;
 use super::runtime::{resume, run_turn, ConversationStore, RunParams};
 use super::service;
 use super::store::{DbArtifactStore, DbMemoryStore, DbStore};
@@ -170,8 +172,17 @@ pub async fn execute(
             .with(agent.tools())
             .with(builtin_artifact_tools())
             .with(builtin_context_tools())
-            .with(builtin_memory_tools()),
+            .with(builtin_memory_tools())
+            .with(builtin_state_tools()),
     );
+
+    // Stream the current shared state so a connecting client can render it
+    // before the run produces any deltas.
+    if let Some(state) = conversation.state.clone() {
+        let _ = sink
+            .emit(AguiEvent::StateSnapshot { snapshot: state })
+            .await;
+    }
 
     let params = RunParams {
         system,

@@ -38,6 +38,8 @@ impl MigrationTrait for Migration {
                 // reads. `metadata` is a free-form app extensibility slot.
                 ("scope", ColType::JsonBinaryNull),
                 ("metadata", ColType::JsonBinaryNull),
+                // Shared, evolving run state (AG-UI STATE_SNAPSHOT / STATE_DELTA).
+                ("state", ColType::JsonBinaryNull),
             ],
             &[],
         )

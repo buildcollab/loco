@@ -39,6 +39,10 @@ pub mod conversations {
         /// Free-form app extensibility slot for non-scoping data.
         #[sea_orm(column_type = "JsonBinary", nullable)]
         pub metadata: Option<Json>,
+        /// Shared, evolving run state (AG-UI `STATE_SNAPSHOT` / `STATE_DELTA`):
+        /// structured working memory the agent updates and the UI reflects live.
+        #[sea_orm(column_type = "JsonBinary", nullable)]
+        pub state: Option<Json>,
     }
 
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

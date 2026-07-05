@@ -87,6 +87,16 @@ pub enum AguiEvent {
     /// event log. Mirrors AG-UI's custom-event convention.
     #[serde(rename = "CUSTOM", rename_all = "camelCase")]
     Custom { name: String, value: Value },
+
+    /// The full shared-state object for the run (AG-UI `STATE_SNAPSHOT`). Emitted
+    /// at run start so a (re)connecting client can render the current state.
+    #[serde(rename = "STATE_SNAPSHOT", rename_all = "camelCase")]
+    StateSnapshot { snapshot: Value },
+
+    /// An incremental shared-state update (AG-UI `STATE_DELTA`). `delta` is a
+    /// shallow merge-patch object applied over the current state.
+    #[serde(rename = "STATE_DELTA", rename_all = "camelCase")]
+    StateDelta { delta: Value },
 }
 
 /// Terminal outcome of a run.
@@ -159,6 +169,8 @@ impl AguiEvent {
             Self::RunFinished { .. } => "RUN_FINISHED",
             Self::RunError { .. } => "RUN_ERROR",
             Self::Custom { .. } => "CUSTOM",
+            Self::StateSnapshot { .. } => "STATE_SNAPSHOT",
+            Self::StateDelta { .. } => "STATE_DELTA",
         }
     }
 }
