@@ -71,6 +71,7 @@ pub mod artifact;
 pub mod context;
 pub mod guardrail;
 pub mod hub;
+pub mod interact;
 pub mod memory;
 pub mod protocol;
 pub mod provider;
@@ -110,6 +111,7 @@ pub use context::{
     NoTokens, ToolContext, TokenResolver,
 };
 pub use guardrail::{BudgetLimiter, Guardrail, NoGuardrail, TokenBudget, Unlimited};
+pub use interact::builtin_interact_tools;
 pub use memory::builtin_memory_tools;
 pub use hub::{
     channel_stream, in_memory, HubEvent, HubEventStream, HubSink, InMemoryRunHub, RunHandle,
@@ -148,6 +150,7 @@ pub use provider::{
 pub use runtime::{
     resume, resume_with_subagents, run_turn, run_turn_with_subagents, AllowAll, ConversationStore,
     MessageRef, PendingToolCall, RunParams, ToolAuthorizer, ToolDecision, ToolExecutor, ToolRef,
+    ASK_USER_TOOL,
 };
 pub use subagent::{
     default_task_schema, CompositeToolExecutor, InMemoryStore, LocalSubagent, Subagent,

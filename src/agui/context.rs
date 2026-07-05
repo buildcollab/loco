@@ -31,9 +31,10 @@ use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::agui::agent::{AgentCtx, Principal};
+use crate::agui::protocol::AguiEvent;
 use crate::agui::transport::EventSink;
 use crate::app::AppContext;
 use crate::{Error, Result};
@@ -260,6 +261,32 @@ impl ToolContext {
     #[must_use]
     pub fn ext<T: Any + Send + Sync>(&self) -> Option<&T> {
         self.extensions.as_ref().and_then(|e| e.downcast_ref::<T>())
+    }
+
+    /// Emit a live progress update from a long-running tool (streamed as a
+    /// `CUSTOM` "tool_progress" event). Best-effort — a missing sink is a no-op.
+    pub async fn progress(&self, message: impl Into<String>) {
+        if let Some(sink) = &self.sink {
+            let _ = sink
+                .emit(AguiEvent::Custom {
+                    name: "tool_progress".to_string(),
+                    value: json!({ "runId": self.run_id, "message": message.into() }),
+                })
+                .await;
+        }
+    }
+
+    /// Emit an arbitrary `CUSTOM` event from a tool (e.g. an app-specific UI
+    /// update). Best-effort.
+    pub async fn emit(&self, name: impl Into<String>, value: Value) {
+        if let Some(sink) = &self.sink {
+            let _ = sink
+                .emit(AguiEvent::Custom {
+                    name: name.into(),
+                    value,
+                })
+                .await;
+        }
     }
 
     /// Attach the run's token resolver. Builder style.

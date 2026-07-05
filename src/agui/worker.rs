@@ -48,6 +48,7 @@ use super::context::{ArtifactStore, MemoryStore};
 use super::context_tool::builtin_context_tools;
 use super::entities::conversations;
 use super::hub::{run_hub, HubSink};
+use super::interact::builtin_interact_tools;
 use super::memory::builtin_memory_tools;
 use super::protocol::{AguiEvent, RunAgentInput};
 use super::state_tool::builtin_state_tools;
@@ -183,8 +184,20 @@ pub async fn execute(
             .with(builtin_artifact_tools())
             .with(builtin_context_tools())
             .with(builtin_memory_tools())
-            .with(builtin_state_tools()),
+            .with(builtin_state_tools())
+            .with(builtin_interact_tools()),
     );
+
+    // Auto-title a fresh conversation from its first user message (cheap
+    // heuristic — no extra model call).
+    if conversation.title.is_none() {
+        if let Some(msg) = &args.input.message {
+            let title: String = msg.trim().chars().take(60).collect();
+            if !title.is_empty() {
+                let _ = service::set_title(&ctx.db, conversation.id, &title).await;
+            }
+        }
+    }
 
     // Stream the current shared state so a connecting client can render it
     // before the run produces any deltas.
@@ -480,7 +493,7 @@ mod tests {
             message: None,
             resume: vec![ResumeItem {
                 interrupt_id: "i1".to_string(),
-                payload: ResumePayload { approved: true },
+                payload: ResumePayload { approved: true, input: None },
             }],
         };
         seed_turn(&store, &resume).await.unwrap();

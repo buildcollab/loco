@@ -58,6 +58,10 @@ use crate::{Error, Result};
 /// parent pending delegation call's arguments (so `resume` can route back).
 const SUBAGENT_STATE_KEY: &str = "__subagent_state";
 
+/// Name of the built-in tool whose approval interrupt is answered by the user's
+/// free-text `input` on resume (rather than by re-executing the tool).
+pub const ASK_USER_TOOL: &str = "ask_user";
+
 /// Handle to a persisted message, identified by its public id (used verbatim in
 /// emitted events).
 #[derive(Debug, Clone)]
@@ -726,7 +730,15 @@ where
                 .iter()
                 .find(|s| s.name == call.name)
                 .map_or(ToolKind::Write, |s| s.kind);
-            let (status, result) = match authz.authorize(&call, kind).await? {
+            let (status, result) = if call.name == ASK_USER_TOOL {
+                // An `ask_user` interrupt is answered by resume input, not by
+                // re-executing the tool: the user's reply becomes its result.
+                let answer = item.payload.input.clone().unwrap_or(Value::Null);
+                let r = json!({ "answer": answer });
+                store.complete_tool_call(&tref, "success", &r, 0).await?;
+                ("success", r)
+            } else {
+                match authz.authorize(&call, kind).await? {
                 ToolDecision::Deny { reason } => {
                     let denied = json!({ "denied": true, "reason": reason });
                     store
@@ -749,6 +761,7 @@ where
                     .await?;
                     params.hooks.after_tool(&ctx, &call, &r).await?;
                     (s, r)
+                }
                 }
             };
             parts.push(part_tool_use(&call.id, &call.name, &call.arguments));
@@ -2000,7 +2013,7 @@ mod tests {
         let resume_sink = VecSink::default();
         let item = ResumeItem {
             interrupt_id: "call_stub_save_note".to_string(),
-            payload: ResumePayload { approved: true },
+            payload: ResumePayload { approved: true, input: None },
         };
         resume(
             &store,
@@ -2050,7 +2063,7 @@ mod tests {
         let resume_sink = VecSink::default();
         let item = ResumeItem {
             interrupt_id: "call_stub_save_note".to_string(),
-            payload: ResumePayload { approved: false },
+            payload: ResumePayload { approved: false, input: None },
         };
         resume(
             &store,
@@ -2275,7 +2288,7 @@ mod tests {
         let resume_sink = VecSink::default();
         let item = ResumeItem {
             interrupt_id: "del_1".to_string(),
-            payload: ResumePayload { approved: true },
+            payload: ResumePayload { approved: true, input: None },
         };
         resume_with_subagents(
             &store,
@@ -2329,7 +2342,7 @@ mod tests {
         let resume_sink = VecSink::default();
         let item = ResumeItem {
             interrupt_id: "del_1".to_string(),
-            payload: ResumePayload { approved: false },
+            payload: ResumePayload { approved: false, input: None },
         };
         resume_with_subagents(
             &store,

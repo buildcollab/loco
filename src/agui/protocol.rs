@@ -152,10 +152,14 @@ pub struct ResumeItem {
     pub payload: ResumePayload,
 }
 
-/// Payload for a [`ResumeItem`] — currently a simple approve/deny gate.
+/// Payload for a [`ResumeItem`]: an approve/deny gate, plus optional `input` for
+/// an `ask_user` interrupt (the user's answer to a clarifying question).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResumePayload {
     pub approved: bool,
+    /// The user's answer when resuming an `ask_user` interrupt.
+    #[serde(default)]
+    pub input: Option<Value>,
 }
 
 impl AguiEvent {

@@ -157,3 +157,19 @@ pub async fn set_active_run(
 pub async fn clear_active_run(db: &DatabaseConnection, conversation_id: i32) -> Result<()> {
     set_active_run(db, conversation_id, None).await
 }
+
+/// Set a conversation's `title` (used for auto-titling a fresh thread).
+///
+/// # Errors
+/// Propagates DB errors while updating the conversation.
+pub async fn set_title(db: &DatabaseConnection, conversation_id: i32, title: &str) -> Result<()> {
+    if let Some(row) = conversations::Entity::find_by_id(conversation_id)
+        .one(db)
+        .await?
+    {
+        let mut am = row.into_active_model();
+        am.title = Set(Some(title.to_string()));
+        am.update(db).await?;
+    }
+    Ok(())
+}
