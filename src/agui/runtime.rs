@@ -42,6 +42,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::agui::agent::{AgentHooks, NoopHooks, RunCtx};
+use crate::agui::context::ToolContext;
 use crate::agui::protocol::{
     part_text, part_tool_result, part_tool_use, AguiEvent, Interrupt, ResumeItem, RunOutcome,
 };
@@ -84,12 +85,13 @@ pub trait ToolExecutor: Send + Sync {
     /// The tools available this run (name, schema, read/write kind).
     fn specs(&self) -> Vec<ToolSpec>;
 
-    /// Execute a tool by name.
+    /// Execute a tool by name, with the run's [`ToolContext`] (app deps,
+    /// principal, scope, token resolver, artifact store, custom deps).
     ///
     /// # Errors
     /// Tool failures surface as `Err`; the run-loop records them as an `error`
     /// tool result and continues.
-    async fn execute(&self, name: &str, args: Value) -> Result<Value>;
+    async fn execute(&self, ctx: &ToolContext, name: &str, args: Value) -> Result<Value>;
 }
 
 /// The outcome of an authorization check for a single tool call.
@@ -149,8 +151,8 @@ impl<T: ?Sized + ToolExecutor> ToolExecutor for Box<T> {
     fn specs(&self) -> Vec<ToolSpec> {
         (**self).specs()
     }
-    async fn execute(&self, name: &str, args: Value) -> Result<Value> {
-        (**self).execute(name, args).await
+    async fn execute(&self, ctx: &ToolContext, name: &str, args: Value) -> Result<Value> {
+        (**self).execute(ctx, name, args).await
     }
 }
 
@@ -161,8 +163,8 @@ impl<T: ?Sized + ToolExecutor> ToolExecutor for Arc<T> {
     fn specs(&self) -> Vec<ToolSpec> {
         (**self).specs()
     }
-    async fn execute(&self, name: &str, args: Value) -> Result<Value> {
-        (**self).execute(name, args).await
+    async fn execute(&self, ctx: &ToolContext, name: &str, args: Value) -> Result<Value> {
+        (**self).execute(ctx, name, args).await
     }
 }
 
@@ -249,6 +251,10 @@ pub struct RunParams {
     /// Lifecycle hooks fired around the run / each turn / each tool call.
     /// Defaults to a no-op; a trait object to avoid another run-loop generic.
     pub hooks: Arc<dyn AgentHooks>,
+    /// The context handed to every tool call (app deps, principal, scope, token
+    /// resolver, artifact store, custom deps). Cloned into each tool's task.
+    /// Defaults to a detached context (no app) for subagent / test runs.
+    pub tool_ctx: ToolContext,
     /// Cooperative cancellation for an explicit "stop". The loop polls this
     /// between turns and around tool calls, and races it during streaming; on
     /// cancel it persists partial output and finalizes as `"cancelled"`.
@@ -266,6 +272,7 @@ impl Default for RunParams {
             max_tool_turns: 8,
             tool_timeout: None,
             hooks: Arc::new(NoopHooks),
+            tool_ctx: ToolContext::default(),
             cancel: CancellationToken::new(),
         }
     }
@@ -721,8 +728,15 @@ where
                 // repeated `RequireApproval` as an allow rather than looping.
                 ToolDecision::Allow | ToolDecision::RequireApproval { .. } => {
                     params.hooks.before_tool(&ctx, &call).await?;
-                    let (s, r) =
-                        execute_and_record(&exec, store, &tref, &call, params.tool_timeout).await?;
+                    let (s, r) = execute_and_record(
+                        &exec,
+                        store,
+                        &tref,
+                        &call,
+                        &params.tool_ctx,
+                        params.tool_timeout,
+                    )
+                    .await?;
                     params.hooks.after_tool(&ctx, &call, &r).await?;
                     (s, r)
                 }
@@ -1126,8 +1140,15 @@ where
                     })
                     .await?;
 
-                    let (status, result) =
-                        execute_and_record(exec, store, &tref, call, params.tool_timeout).await?;
+                    let (status, result) = execute_and_record(
+                        exec,
+                        store,
+                        &tref,
+                        call,
+                        &params.tool_ctx,
+                        params.tool_timeout,
+                    )
+                    .await?;
                     params.hooks.after_tool(ctx, call, &result).await?;
                     sink.emit(AguiEvent::ToolCallResult {
                         message_id: msg.id.clone(),
@@ -1208,6 +1229,7 @@ async fn execute_and_record<E, S>(
     store: &S,
     tref: &ToolRef,
     call: &ToolCallReq,
+    tool_ctx: &ToolContext,
     timeout: Option<Duration>,
 ) -> Result<(&'static str, Value)>
 where
@@ -1219,7 +1241,10 @@ where
         let exec = Arc::clone(exec);
         let name = call.name.clone();
         let args = call.arguments.clone();
-        async move { exec.execute(&name, args).await }
+        // The tool runs on its own task, so the context must be owned there;
+        // `ToolContext` is `Clone` (all-owned/`Arc` fields) for exactly this.
+        let ctx = tool_ctx.clone();
+        async move { exec.execute(&ctx, &name, args).await }
     });
     let guard = AbortOnDrop(handle);
 
@@ -1640,7 +1665,7 @@ mod tests {
                 },
             ]
         }
-        async fn execute(&self, name: &str, _args: Value) -> Result<Value> {
+        async fn execute(&self, _ctx: &ToolContext, name: &str, _args: Value) -> Result<Value> {
             Ok(json!({ "ok": name }))
         }
     }
@@ -2155,7 +2180,7 @@ mod tests {
                 kind: ToolKind::Write,
             }]
         }
-        async fn execute(&self, name: &str, _args: Value) -> Result<Value> {
+        async fn execute(&self, _ctx: &ToolContext, name: &str, _args: Value) -> Result<Value> {
             Ok(json!({ "saved": name }))
         }
     }
@@ -2308,7 +2333,7 @@ mod tests {
                 kind: ToolKind::Read,
             }]
         }
-        async fn execute(&self, _name: &str, _args: Value) -> Result<Value> {
+        async fn execute(&self, _ctx: &ToolContext, _name: &str, _args: Value) -> Result<Value> {
             panic!("kaboom");
         }
     }
@@ -2366,7 +2391,7 @@ mod tests {
                 kind: ToolKind::Read,
             }]
         }
-        async fn execute(&self, _name: &str, _args: Value) -> Result<Value> {
+        async fn execute(&self, _ctx: &ToolContext, _name: &str, _args: Value) -> Result<Value> {
             tokio::time::sleep(Duration::from_millis(500)).await;
             Ok(json!({ "ok": true }))
         }

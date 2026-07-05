@@ -67,6 +67,8 @@
 //! ```
 
 pub mod agent;
+pub mod artifact;
+pub mod context;
 pub mod hub;
 pub mod protocol;
 pub mod provider;
@@ -79,9 +81,13 @@ pub mod transport;
 // entities, the `ConversationStore`, config-driven factories, the reusable HTTP
 // router, and the durable worker. Enabled together with the `with-db` feature.
 #[cfg(feature = "with-db")]
+pub mod context_tool;
+#[cfg(feature = "with-db")]
 pub mod controller;
 #[cfg(feature = "with-db")]
 pub mod entities;
+#[cfg(feature = "with-db")]
+pub mod scope;
 #[cfg(feature = "with-db")]
 pub mod service;
 #[cfg(feature = "with-db")]
@@ -91,6 +97,10 @@ pub mod worker;
 
 // Flat re-exports for ergonomic `use loco_rs::agui::{...}`.
 pub use agent::{Agent, AgentCtx, AgentHooks, AgentRegistry, NoopHooks, Principal, RunCtx};
+pub use artifact::builtin_artifact_tools;
+pub use context::{
+    Artifact, ArtifactStore, NewArtifact, NoTokens, ToolContext, TokenResolver,
+};
 pub use hub::{
     channel_stream, in_memory, HubEvent, HubEventStream, HubSink, InMemoryRunHub, RunHandle,
     RunHub, DEFAULT_BUFFER_CAP,
@@ -98,9 +108,16 @@ pub use hub::{
 #[cfg(feature = "with-db")]
 pub use hub::{run_hub, DbRunHub};
 #[cfg(feature = "with-db")]
-pub use service::{assemble_system, clear_active_run, provider as config_provider, set_active_run};
+pub use context_tool::builtin_context_tools;
 #[cfg(feature = "with-db")]
-pub use store::DbStore;
+pub use scope::{NoScope, ScopeResolver};
+#[cfg(feature = "with-db")]
+pub use service::{
+    assemble_system, clear_active_run, create_conversation, find_conversation,
+    provider as config_provider, set_active_run,
+};
+#[cfg(feature = "with-db")]
+pub use store::{DbArtifactStore, DbStore};
 #[cfg(feature = "with-db")]
 pub use worker::{
     dispatch_run, execute, spawn_inline, start_run, RunAgentJob, RunArgs, StartedRun,

@@ -41,6 +41,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
+use crate::agui::context::ToolContext;
 use crate::agui::protocol::{Interrupt, ResumeItem, ResumePayload};
 use crate::agui::provider::{ChatMessage, Provider, ToolCallReq, ToolKind, ToolSpec, Usage};
 use crate::agui::runtime::{
@@ -438,7 +439,10 @@ impl ToolExecutor for SubagentExecutor {
         self.registry.specs()
     }
 
-    async fn execute(&self, name: &str, args: Value) -> Result<Value> {
+    async fn execute(&self, _ctx: &ToolContext, name: &str, args: Value) -> Result<Value> {
+        // A subagent runs its own nested `run_turn` with its own local tools and
+        // (detached) `ToolContext`; the parent's context is not forwarded into
+        // the child run.
         if self.depth >= self.max_depth {
             warn!(
                 target: "loco_rs::agui",
@@ -507,10 +511,10 @@ impl ToolExecutor for CompositeToolExecutor {
         out
     }
 
-    async fn execute(&self, name: &str, args: Value) -> Result<Value> {
+    async fn execute(&self, ctx: &ToolContext, name: &str, args: Value) -> Result<Value> {
         for e in &self.execs {
             if e.specs().iter().any(|s| s.name == name) {
-                return e.execute(name, args).await;
+                return e.execute(ctx, name, args).await;
             }
         }
         Err(Error::Message(format!("no executor for tool: {name}")))
@@ -740,7 +744,7 @@ mod tests {
                 kind: ToolKind::Read,
             }]
         }
-        async fn execute(&self, name: &str, _args: Value) -> Result<Value> {
+        async fn execute(&self, _ctx: &ToolContext, name: &str, _args: Value) -> Result<Value> {
             Ok(json!({ "ok": name }))
         }
     }
@@ -815,7 +819,7 @@ mod tests {
         assert_eq!(specs[0].kind, ToolKind::Read);
 
         let res = exec
-            .execute("sum", json!({ "input": "text" }))
+            .execute(&ToolContext::default(), "sum", json!({ "input": "text" }))
             .await
             .unwrap();
         assert!(res["output"].as_str().unwrap().contains("done"));
@@ -825,7 +829,10 @@ mod tests {
     async fn subagent_executor_unknown_and_missing_input() {
         let reg = Arc::new(SubagentRegistry::default());
         let exec = SubagentExecutor::new(reg, null_sink());
-        assert!(exec.execute("nope", json!({"input":"x"})).await.is_err());
+        assert!(exec
+            .execute(&ToolContext::default(), "nope", json!({"input":"x"}))
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -842,7 +849,10 @@ mod tests {
         });
         // Pin depth == max so any delegation trips the guard.
         let exec = SubagentExecutor::at_depth(Arc::new(reg), null_sink(), 3, 3);
-        assert!(exec.execute("sum", json!({"input":"x"})).await.is_err());
+        assert!(exec
+            .execute(&ToolContext::default(), "sum", json!({"input":"x"}))
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -867,13 +877,14 @@ mod tests {
         assert!(names.contains(&"sum".to_string()));
 
         // Routes to the app tool.
+        let ctx = ToolContext::default();
         assert_eq!(
-            composite.execute("noop", json!({})).await.unwrap()["ok"],
+            composite.execute(&ctx, "noop", json!({})).await.unwrap()["ok"],
             "noop"
         );
         // Routes to the subagent.
         assert!(composite
-            .execute("sum", json!({"input":"x"}))
+            .execute(&ctx, "sum", json!({"input":"x"}))
             .await
             .unwrap()["output"]
             .as_str()
@@ -927,7 +938,9 @@ mod tests {
             max_tool_turns: 2,
         });
         let exec = SubagentExecutor::new(Arc::new(reg), sink);
-        exec.execute("sum", json!({"input":"x"})).await.unwrap();
+        exec.execute(&ToolContext::default(), "sum", json!({"input":"x"}))
+            .await
+            .unwrap();
         // The child run emitted its lifecycle into the provided (DB-logging-style) sink.
         let names = collector.0.lock().unwrap();
         assert_eq!(names.first().map(String::as_str), Some("RUN_STARTED"));

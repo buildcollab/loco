@@ -15,7 +15,8 @@ use sea_orm::{
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use super::entities::{conversations, messages, tool_calls};
+use super::context::{Artifact, ArtifactStore, NewArtifact};
+use super::entities::{artifacts, conversations, messages, tool_calls};
 use super::provider::{history_from_parts, ChatMessage, ToolCallReq, Usage};
 use super::runtime::{ConversationStore, MessageRef, PendingToolCall, ToolRef};
 use crate::{Error, Result};
@@ -188,5 +189,124 @@ impl ConversationStore for DbStore {
         item.status = Set(Some(status.to_string()));
         item.update(&self.db).await?;
         Ok(())
+    }
+}
+
+/// [`ArtifactStore`](super::context::ArtifactStore) over the `artifacts` table,
+/// scoped to a single conversation. Built by the framework in
+/// [`worker::execute`](super::worker::execute) and placed on the run's
+/// [`ToolContext`](super::context::ToolContext).
+pub struct DbArtifactStore {
+    /// The database connection (from `AppContext::db`).
+    pub db: DatabaseConnection,
+    /// The conversation these artifacts belong to.
+    pub conversation_id: i32,
+}
+
+impl DbArtifactStore {
+    /// Build a store bound to `conversation_id` on `db`.
+    #[must_use]
+    pub fn new(db: DatabaseConnection, conversation_id: i32) -> Self {
+        Self {
+            db,
+            conversation_id,
+        }
+    }
+
+    async fn find(&self, pid: &str) -> Result<Option<artifacts::Model>> {
+        let uuid = Uuid::parse_str(pid).map_err(|e| Error::Message(e.to_string()))?;
+        Ok(artifacts::Entity::find()
+            .filter(artifacts::Column::Pid.eq(uuid))
+            .filter(artifacts::Column::ConversationId.eq(self.conversation_id))
+            .one(&self.db)
+            .await?)
+    }
+}
+
+/// Read a JSON array-of-strings column into a `Vec<String>`.
+fn tags_from_json(v: &Option<Value>) -> Vec<String> {
+    v.as_ref()
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|t| t.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn to_artifact(m: artifacts::Model) -> Artifact {
+    Artifact {
+        pid: m.pid.to_string(),
+        name: m.name,
+        kind: m.kind,
+        content: m.content,
+        reference: m.reference,
+        tags: tags_from_json(&m.tags),
+        metadata: m.metadata,
+        version: m.version,
+    }
+}
+
+#[async_trait]
+impl ArtifactStore for DbArtifactStore {
+    async fn create(&self, new: NewArtifact) -> Result<Artifact> {
+        let pid = Uuid::new_v4();
+        let item = artifacts::ActiveModel {
+            pid: Set(pid),
+            conversation_id: Set(self.conversation_id),
+            name: Set(new.name),
+            kind: Set(new.kind),
+            content: Set(new.content),
+            reference: Set(new.reference),
+            tags: Set(Some(json!(new.tags))),
+            metadata: Set(new.metadata),
+            version: Set(1),
+            ..Default::default()
+        };
+        Ok(to_artifact(item.insert(&self.db).await?))
+    }
+
+    async fn update(
+        &self,
+        pid: &str,
+        content: Option<String>,
+        tags: Option<Vec<String>>,
+        metadata: Option<Value>,
+    ) -> Result<Artifact> {
+        let row = self.find(pid).await?.ok_or(Error::NotFound)?;
+        let version = row.version + 1;
+        let mut item = row.into_active_model();
+        if let Some(content) = content {
+            item.content = Set(Some(content));
+        }
+        if let Some(tags) = tags {
+            item.tags = Set(Some(json!(tags)));
+        }
+        if let Some(metadata) = metadata {
+            item.metadata = Set(Some(metadata));
+        }
+        item.version = Set(version);
+        Ok(to_artifact(item.update(&self.db).await?))
+    }
+
+    async fn get(&self, pid: &str) -> Result<Option<Artifact>> {
+        Ok(self.find(pid).await?.map(to_artifact))
+    }
+
+    async fn list(&self, tag: Option<&str>) -> Result<Vec<Artifact>> {
+        let mut rows = artifacts::Entity::find()
+            .filter(artifacts::Column::ConversationId.eq(self.conversation_id))
+            .all(&self.db)
+            .await?;
+        rows.sort_by_key(|a| a.id);
+        Ok(rows
+            .into_iter()
+            .filter(|a| match tag {
+                Some(t) => tags_from_json(&a.tags).iter().any(|x| x == t),
+                None => true,
+            })
+            .map(to_artifact)
+            .collect())
     }
 }

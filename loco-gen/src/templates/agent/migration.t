@@ -33,6 +33,11 @@ impl MigrationTrait for Migration {
                 ("mode", ColType::StringNull),
                 ("status", ColType::StringNull),
                 ("active_run_id", ColType::StringNull),
+                // Tenancy: an app-defined scope value (e.g. {organization_id,
+                // project_id}) set by the controller at create and used to scope
+                // reads. `metadata` is a free-form app extensibility slot.
+                ("scope", ColType::JsonBinaryNull),
+                ("metadata", ColType::JsonBinaryNull),
             ],
             &[],
         )
@@ -85,11 +90,35 @@ impl MigrationTrait for Migration {
             &[
                 ("id", ColType::PkAuto),
                 ("pid", ColType::UuidUniq),
+                // Optional message this item is attached to (message-scoped
+                // context / attachments). NULL = conversation-scoped.
+                ("message_id", ColType::IntegerNull),
                 ("kind", ColType::String),
                 ("name", ColType::String),
                 ("reference", ColType::StringNull),
                 ("content", ColType::TextNull),
                 ("metadata", ColType::JsonBinaryNull),
+            ],
+            &[("conversations", "")],
+        )
+        .await?;
+
+        // Artifacts: persistent deliverables (documents/reports) the agent
+        // produced, scoped to a conversation and mutable by the built-in artifact
+        // tools. `tags` is a JSON array of strings; `version` bumps on update.
+        create_table(
+            m,
+            "artifacts",
+            &[
+                ("id", ColType::PkAuto),
+                ("pid", ColType::UuidUniq),
+                ("name", ColType::String),
+                ("kind", ColType::StringNull),
+                ("content", ColType::TextNull),
+                ("reference", ColType::StringNull),
+                ("tags", ColType::JsonBinaryNull),
+                ("metadata", ColType::JsonBinaryNull),
+                ("version", ColType::IntegerWithDefault(1)),
             ],
             &[("conversations", "")],
         )
@@ -137,6 +166,7 @@ impl MigrationTrait for Migration {
     async fn down(&self, m: &SchemaManager) -> Result<(), DbErr> {
         drop_table(m, "agent_events").await?;
         drop_table(m, "agent_runs").await?;
+        drop_table(m, "artifacts").await?;
         drop_table(m, "context_items").await?;
         drop_table(m, "tool_calls").await?;
         drop_table(m, "messages").await?;

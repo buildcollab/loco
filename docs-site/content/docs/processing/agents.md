@@ -262,6 +262,7 @@ let run = start_run(
     "report_writer",                       // agent id
     "Generate the Q3 sales report",        // the trigger prompt
     Principal::default(),                  // no request principal in the background
+    None,                                  // tenancy scope (e.g. Some(json!({ "organization_id": 42 })))
 ).await?;
 ```
 
@@ -281,10 +282,11 @@ Two idiomatic ways to consume the result:
 
 - **Read the reply** from `messages` once the run finishes (poll, or subscribe
   to the run's stream with the returned `run_id`).
-- **Let a tool be the deliverable** — give `report_writer` a `save_report` tool
-  that writes to storage / the DB / email. The artifact is then the side effect
-  and you never have to read messages back. This is usually the better fit for
-  report generation.
+- **Produce an artifact** — have the agent call the built-in `create_artifact`
+  tool (see [Artifacts](#tool-context-artifacts-tenancy--tokens) below). The
+  deliverable persists on the `artifacts` table and is fetchable at
+  `GET conversations/{pid}/artifacts`, so you never read messages back. This is
+  usually the better fit for report generation.
 
 Pair `start_run` with the [scheduler](@/docs/processing/scheduler.md) for
 recurring work (a nightly digest, a weekly report). For durability the same
@@ -310,6 +312,54 @@ DB-backed `agui.hub`.
   call or require human approval. Approval surfaces as an AG-UI interrupt; the
   client answers by POSTing a `resume` instruction to `/run`.
 
+## Tool context, artifacts, tenancy & tokens
+
+Every tool call receives a `ToolContext` carrying the run's dependencies. It is
+derived from the `AgentCtx` and rebuilt on the **executing node** (from the app
+context, the principal, and the persisted conversation row), so nothing crosses
+a serialized worker payload and inline/worker runs behave identically.
+
+```rust
+async fn call(&self, ctx: &ToolContext, args: MyArgs) -> Result<Value> {
+    let app   = ctx.app();          // Option<&AppContext> — DB, storage, config
+    let who   = &ctx.principal;     // the authenticated caller
+    let scope = ctx.scope.as_ref(); // tenancy value (org/project), for billing/scoping
+    let token = ctx.tokens();       // Option<Arc<dyn TokenResolver>>
+    let deps  = ctx.ext::<MyDeps>(); // your custom deps (see below)
+    // ...
+}
+```
+
+- **Custom deps.** Override `Agent::extensions` to return an `Arc<dyn Any + Send +
+  Sync>` (your own deps struct); recover it in a tool with `ctx.ext::<MyDeps>()`.
+  It is built on the executing node, so it works under worker execution.
+- **Token resolver.** Override `Agent::token_resolver` to return an
+  `Arc<dyn TokenResolver>`; a tool calls `ctx.tokens().resolve("audience")` to
+  mint/exchange a **fresh** access token — correct for long-running and durable
+  runs whose captured principal would otherwise go stale.
+- **Artifacts.** The framework injects built-in artifact tools —
+  `create_artifact`, `update_artifact`, `get_artifact`, `list_artifacts`,
+  `tag_artifact`. They persist to the `artifacts` table (id, name, kind,
+  content/reference, `tags`, metadata, version), emit a `CUSTOM` event through the
+  run hub (so a reconnecting client on any node sees them), and are fetchable at
+  `GET conversations/{pid}/artifacts` and `.../artifacts/{artifact_pid}`.
+- **Context & uploads.** Attach context to a conversation with
+  `POST conversations/{pid}/context`, or upload a file with
+  `POST conversations/{pid}/context/upload` (multipart → shared `Storage`). The
+  agent reads them with the built-in `list_context` / `read_context` tools.
+
+### Multitenancy (scoping conversations)
+
+Conversations carry a `scope` JSON column. Tenant them by implementing a
+`ScopeResolver` (compute the scope from request headers — e.g. an
+`X-Organization-Id` — after loading/authorizing the org/project) and mounting it
+with `routes_with_scope(registry, scope)`. The resolver stamps the scope on
+create and filters every conversation read through one choke point, so a request
+cannot reach a conversation outside its scope. The scope is read back off the row
+on the executing node and exposed to tools via `ctx.scope`. Apps that own their
+controller can call `service::create_conversation` / `service::find_conversation`
+directly.
+
 ## What lives where
 
 | Concern                              | Location                                   |
@@ -318,6 +368,10 @@ DB-backed `agui.hub`.
 | LLM provider abstraction             | `loco_rs::agui::provider`                  |
 | Run loop (`run_turn` / `resume`)     | `loco_rs::agui::runtime`                   |
 | Typed tools                          | `loco_rs::agui::tool`                      |
+| Tool context (deps/scope/tokens)     | `loco_rs::agui::context`                   |
+| Built-in artifact tools              | `loco_rs::agui::artifact`                  |
+| Built-in context/upload tools        | `loco_rs::agui::context_tool`              |
+| Tenancy scope resolver               | `loco_rs::agui::scope`                     |
 | Subagents                            | `loco_rs::agui::subagent`                  |
 | Agent trait + registry + hooks       | `loco_rs::agui::agent`                     |
 | Run hub (resumable/cancellable)      | `loco_rs::agui::hub`                        |

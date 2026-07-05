@@ -19,6 +19,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value;
 
+use crate::agui::context::{NoTokens, TokenResolver};
 use crate::agui::provider::{ToolCallReq, TurnOutcome};
 use crate::agui::runtime::{AllowAll, ToolAuthorizer};
 use crate::agui::tool::Tools;
@@ -54,10 +55,21 @@ pub struct AgentCtx<'a> {
     pub app: &'a AppContext,
     /// Public id of the conversation (AG-UI `thread_id`).
     pub thread_id: String,
+    /// Numeric id of the conversation (for store/artifact scoping).
+    pub conversation_id: i32,
     /// Selected conversation mode, if any.
     pub mode: Option<String>,
     /// The authenticated caller.
     pub principal: Principal,
+    /// The persisted tenancy value (org/project/...), read from the conversation
+    /// row. `None` when the conversation is unscoped. Threaded into the
+    /// [`ToolContext`](crate::agui::context::ToolContext) for scoping/billing.
+    pub scope: Option<serde_json::Value>,
+    /// App-defined custom dependencies, built by [`Agent::extensions`] on the
+    /// executing node and forwarded onto the
+    /// [`ToolContext`](crate::agui::context::ToolContext). Downcast with
+    /// [`ToolContext::ext`](crate::agui::context::ToolContext::ext).
+    pub extensions: Arc<dyn std::any::Any + Send + Sync>,
 }
 
 /// Lightweight, app-agnostic context passed to [`AgentHooks`] from inside the
@@ -153,6 +165,28 @@ pub trait Agent: Send + Sync {
     /// write/approval gate still applies).
     fn authorizer(&self, _ctx: &AgentCtx<'_>) -> Arc<dyn ToolAuthorizer> {
         Arc::new(AllowAll)
+    }
+
+    /// The token resolver this agent's tools use to obtain access tokens for
+    /// external services (defaults to [`NoTokens`]). Built on the executing node
+    /// from `ctx` so long-running / worker runs mint fresh tokens rather than
+    /// replaying a captured (expired) one.
+    fn token_resolver(&self, _ctx: &AgentCtx<'_>) -> Arc<dyn TokenResolver> {
+        Arc::new(NoTokens)
+    }
+
+    /// App-defined custom dependencies to place on the run's
+    /// [`ToolContext`](crate::agui::context::ToolContext). Return your own deps
+    /// struct as `Arc<dyn Any + Send + Sync>`; tools recover it with
+    /// [`ToolContext::ext`](crate::agui::context::ToolContext::ext). Defaults to
+    /// an empty unit. Built on the executing node, so it is multi-node safe (no
+    /// value crosses a serialized job payload).
+    fn extensions(
+        &self,
+        _app: &AppContext,
+        _principal: &Principal,
+    ) -> Arc<dyn std::any::Any + Send + Sync> {
+        Arc::new(())
     }
 }
 

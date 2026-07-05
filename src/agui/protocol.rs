@@ -79,6 +79,14 @@ pub enum AguiEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         code: Option<String>,
     },
+
+    /// A generic, application-defined event. `name` identifies the kind (e.g.
+    /// `"artifact"`) and `value` carries its payload. This keeps the protocol
+    /// free of specific app concepts while letting the framework and apps stream
+    /// structured side-channel updates through the same (persisted, replayable)
+    /// event log. Mirrors AG-UI's custom-event convention.
+    #[serde(rename = "CUSTOM", rename_all = "camelCase")]
+    Custom { name: String, value: Value },
 }
 
 /// Terminal outcome of a run.
@@ -150,6 +158,7 @@ impl AguiEvent {
             Self::ToolCallResult { .. } => "TOOL_CALL_RESULT",
             Self::RunFinished { .. } => "RUN_FINISHED",
             Self::RunError { .. } => "RUN_ERROR",
+            Self::Custom { .. } => "CUSTOM",
         }
     }
 }

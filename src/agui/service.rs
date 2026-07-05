@@ -7,16 +7,17 @@
 //! not the plumbing that feeds them.
 
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel, QueryFilter,
-    Set,
+    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, IntoActiveModel,
+    QueryFilter, Set,
 };
+use serde_json::Value;
 use uuid::Uuid;
 
 use super::agent::AgentCtx;
 use super::entities::{context_items, conversations};
 use super::provider::RigProvider;
 use crate::app::AppContext;
-use crate::Result;
+use crate::{Error, Result};
 
 /// Build the LLM provider from `agui.provider` config, defaulting the model to
 /// `default_model` (usually the agent's declared model) when config does not
@@ -60,14 +61,72 @@ pub async fn assemble_system(ctx: &AgentCtx<'_>, base: &str) -> Result<String> {
                 .filter(context_items::Column::ConversationId.eq(conv.id))
                 .all(&ctx.app.db)
                 .await?;
+            let mut attachments: Vec<String> = Vec::new();
             for item in items {
                 if let Some(content) = item.content {
                     parts.push(format!("# Context: {}\n{content}", item.name));
+                } else if item.reference.is_some() {
+                    // File/resource with no inline content: tell the model it
+                    // exists so it can fetch it via the `read_context` tool.
+                    attachments.push(item.name);
                 }
+            }
+            if !attachments.is_empty() {
+                parts.push(format!(
+                    "# Attachments\nThe following are attached to this conversation; read one with \
+                     the `read_context` tool: {}",
+                    attachments.join(", ")
+                ));
             }
         }
     }
     Ok(parts.join("\n\n"))
+}
+
+/// Look up a conversation by its public id, applying an optional tenancy
+/// `filter` (from a [`ScopeResolver`](super::scope::ScopeResolver)) so a caller
+/// cannot reach a conversation outside its scope. For apps that wire their own
+/// controller instead of [`routes`](super::controller::routes).
+///
+/// # Errors
+/// [`Error::NotFound`] if no matching (in-scope) conversation exists.
+pub async fn find_conversation(
+    db: &DatabaseConnection,
+    pid: &str,
+    filter: Option<Condition>,
+) -> Result<conversations::Model> {
+    let uuid = Uuid::parse_str(pid).map_err(|e| Error::Message(e.to_string()))?;
+    let mut query =
+        conversations::Entity::find().filter(conversations::Column::Pid.eq(uuid));
+    if let Some(cond) = filter {
+        query = query.filter(cond);
+    }
+    query.one(db).await?.ok_or(Error::NotFound)
+}
+
+/// Create a conversation for `agent_id`, stamping the tenancy `scope` the caller
+/// resolved from the request (e.g. `{organization_id, project_id}`). For apps
+/// that create conversations from their own controller. Returns the new row.
+///
+/// # Errors
+/// Propagates DB errors on insert.
+pub async fn create_conversation(
+    db: &DatabaseConnection,
+    agent_id: &str,
+    title: Option<String>,
+    mode: Option<String>,
+    scope: Option<Value>,
+) -> Result<conversations::Model> {
+    let item = conversations::ActiveModel {
+        pid: Set(Uuid::new_v4()),
+        agent_id: Set(agent_id.to_string()),
+        title: Set(title),
+        mode: Set(mode),
+        status: Set(Some("idle".to_string())),
+        scope: Set(scope),
+        ..Default::default()
+    };
+    Ok(item.insert(db).await?)
 }
 
 /// Point a conversation at its in-flight run so a client can resume or cancel
