@@ -360,6 +360,35 @@ on the executing node and exposed to tools via `ctx.scope`. Apps that own their
 controller can call `service::create_conversation` / `service::find_conversation`
 directly.
 
+## Building blocks for richer agents
+
+The framework injects a set of built-in tools into every run and exposes `Agent`
+factories for the cross-cutting concerns a production, data-collating agent
+needs:
+
+- **Long-term memory (RAG).** `remember` / `search_memory` tools over a
+  tenant-scoped `memories` table; `Agent::embedder` enables semantic (cosine)
+  retrieval, else search is lexical. `cite` streams provenance.
+- **Shared state.** `get_state` / `set_state` / `patch_state` persist structured
+  working memory on the conversation and stream `STATE_SNAPSHOT` / `STATE_DELTA`
+  so the UI reflects "the report so far" live.
+- **Guardrails & budgets.** `Agent::guardrail` can rewrite or block model input
+  and output (PII/injection/moderation); `Agent::budget` caps spend per
+  tenant/run.
+- **Deterministic workflows.** `SequentialAgent` / `ParallelAgent` / `LoopAgent`
+  orchestrate child agents (pipe / fan-out / iterate) without an LLM in the loop.
+- **Structured output.** `Agent::response_schema` constrains the answer to a JSON
+  schema — reliable reports.
+- **Planning & thinking.** `Agent::planner` (see `react_planner()`) adds a
+  plan-then-act directive; the model's reasoning streams as `THINKING_CONTENT`.
+- **Human-in-the-loop.** `ask_user` pauses for a clarifying answer;
+  `suggest_followups` streams next-step prompts; long tools report progress via
+  `ctx.progress()`.
+- **Vision.** `multimodal_content(text, image_urls)` stores a user turn as
+  image+text content for vision models.
+- **Eval.** `EvalCase` + `run_suite` assert on the trajectory (tools called +
+  output) for regression tests.
+
 ## What lives where
 
 | Concern                              | Location                                   |
@@ -371,6 +400,12 @@ directly.
 | Tool context (deps/scope/tokens)     | `loco_rs::agui::context`                   |
 | Built-in artifact tools              | `loco_rs::agui::artifact`                  |
 | Built-in context/upload tools        | `loco_rs::agui::context_tool`              |
+| Long-term memory (RAG)               | `loco_rs::agui::memory`                    |
+| Shared-state tools                   | `loco_rs::agui::state_tool`                |
+| Interaction tools (ask_user, ...)    | `loco_rs::agui::interact`                  |
+| Guardrails + budgets                 | `loco_rs::agui::guardrail`                 |
+| Workflow agents (seq/par/loop)       | `loco_rs::agui::workflow`                  |
+| Trajectory eval harness              | `loco_rs::agui::eval`                      |
 | Tenancy scope resolver               | `loco_rs::agui::scope`                     |
 | Subagents                            | `loco_rs::agui::subagent`                  |
 | Agent trait + registry + hooks       | `loco_rs::agui::agent`                     |
