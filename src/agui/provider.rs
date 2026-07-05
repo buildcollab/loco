@@ -28,6 +28,8 @@ pub const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 pub enum AgentDelta {
     /// A chunk of assistant text.
     TextDelta(String),
+    /// A chunk of the model's out-of-band reasoning ("thinking") text.
+    ReasoningDelta(String),
     /// A tool call has started at stream position `index`.
     ToolCallStart {
         index: usize,
@@ -377,6 +379,10 @@ impl StreamAssembler {
             let reasoning = extract_reasoning(&delta);
             if !reasoning.is_empty() {
                 self.reasoning.push_str(reasoning);
+                // Forward as a live "thinking" delta (distinct from TextDelta) so
+                // the UI can render the model's reasoning without it polluting the
+                // assistant answer.
+                deltas.push(AgentDelta::ReasoningDelta(reasoning.to_string()));
             }
 
             if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {

@@ -12,14 +12,15 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::agui::context::{MemoryStore, NewMemory, ToolContext};
+use crate::agui::protocol::AguiEvent;
 use crate::agui::provider::{ToolKind, ToolSpec};
 use crate::agui::tool::{Tool, Tools};
 use crate::{Error, Result};
 
-/// The framework's built-in memory tools: `remember`, `search_memory`.
+/// The framework's built-in memory tools: `remember`, `search_memory`, `cite`.
 #[must_use]
 pub fn builtin_memory_tools() -> Tools {
-    Tools::new().with(Remember).with(SearchMemory)
+    Tools::new().with(Remember).with(SearchMemory).with(Cite)
 }
 
 fn store(ctx: &ToolContext) -> Result<std::sync::Arc<dyn MemoryStore>> {
@@ -114,6 +115,55 @@ impl Tool for SearchMemory {
     async fn call(&self, ctx: &ToolContext, args: SearchArgs) -> Result<Value> {
         let hits = store(ctx)?.search(&args.query, args.top_k).await?;
         Ok(json!({ "hits": serde_json::to_value(&hits)? }))
+    }
+}
+
+#[derive(Deserialize)]
+struct CiteArgs {
+    text: String,
+    source: String,
+    #[serde(default)]
+    url: Option<String>,
+}
+
+/// Attach a citation (provenance) to the answer, streamed to the UI so a
+/// data-collation answer shows where each claim came from.
+struct Cite;
+
+#[async_trait]
+impl Tool for Cite {
+    type Args = CiteArgs;
+
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "cite".to_string(),
+            description: "Record a citation for a claim in your answer: the cited text and its \
+                          source (a memory/artifact id or URL). Streams provenance to the UI."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string", "description": "The claim/quote being sourced." },
+                    "source": { "type": "string", "description": "Source id (e.g. a memory id) or name." },
+                    "url": { "type": "string", "description": "Optional source URL." }
+                },
+                "required": ["text", "source"]
+            }),
+            kind: ToolKind::Read,
+        }
+    }
+
+    async fn call(&self, ctx: &ToolContext, args: CiteArgs) -> Result<Value> {
+        let citation = json!({ "text": args.text, "source": args.source, "url": args.url });
+        if let Some(sink) = ctx.sink() {
+            let _ = sink
+                .emit(AguiEvent::Custom {
+                    name: "citation".to_string(),
+                    value: citation.clone(),
+                })
+                .await;
+        }
+        Ok(json!({ "cited": true, "citation": citation }))
     }
 }
 

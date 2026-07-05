@@ -101,7 +101,9 @@ pub mod store;
 pub mod worker;
 
 // Flat re-exports for ergonomic `use loco_rs::agui::{...}`.
-pub use agent::{Agent, AgentCtx, AgentHooks, AgentRegistry, NoopHooks, Principal, RunCtx};
+pub use agent::{
+    react_planner, Agent, AgentCtx, AgentHooks, AgentRegistry, NoopHooks, Principal, RunCtx,
+};
 pub use artifact::builtin_artifact_tools;
 pub use context::{
     Artifact, ArtifactStore, Embedder, MemoryHit, MemoryStore, NewArtifact, NewMemory, NoEmbedder,
@@ -135,8 +137,8 @@ pub use worker::{
 // Re-exported so generated app code can build cancellation tokens / run hubs
 // without adding `tokio-util` as a direct dependency.
 pub use protocol::{
-    part_text, part_tool_result, part_tool_use, AguiEvent, Interrupt, ResumeItem, ResumePayload,
-    RunAgentInput, RunOutcome,
+    part_citation, part_text, part_thinking, part_tool_result, part_tool_use, AguiEvent, Interrupt,
+    ResumeItem, ResumePayload, RunAgentInput, RunOutcome,
 };
 pub use provider::{
     history_from_parts, AgentDelta, ChatMessage, Provider, RigConfig, RigProvider, StreamAssembler,

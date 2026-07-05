@@ -126,6 +126,16 @@ pub trait AgentHooks: Send + Sync {
     async fn on_error(&self, _ctx: &RunCtx, _err: &Error) {}
 }
 
+/// A ready-made ReAct-style planning instruction for [`Agent::planner`]: reason
+/// about the goal and the data to gather before acting, using tools to fill gaps.
+#[must_use]
+pub fn react_planner() -> String {
+    "Before answering, briefly plan: restate the goal, list what information you \
+     need and which tools/sources can provide it, then gather it step by step \
+     (calling tools as needed) before writing your final answer."
+        .to_string()
+}
+
 /// A no-op [`AgentHooks`] — the default when an agent declares none.
 pub struct NoopHooks;
 
@@ -158,6 +168,14 @@ pub trait Agent: Send + Sync {
     /// output). When set, the run sends it as the provider `response_format`, so
     /// the agent returns a validated JSON object — ideal for report generation.
     fn response_schema(&self, _ctx: &AgentCtx<'_>) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// An optional planning instruction appended to the system prompt — e.g. a
+    /// ReAct "think step by step, then act" directive that makes multi-step data
+    /// collation more reliable. Returns `None` (no planner) by default;
+    /// [`react_planner`] is a ready-made instruction.
+    fn planner(&self, _ctx: &AgentCtx<'_>) -> Option<String> {
         None
     }
 

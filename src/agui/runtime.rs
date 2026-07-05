@@ -1462,18 +1462,30 @@ where
     let streamed_fwd = Arc::clone(&streamed);
     let forward_fut = async move {
         while let Some(delta) = drx.recv().await {
-            if let AgentDelta::TextDelta(text) = delta {
-                {
-                    streamed_fwd
-                        .lock()
-                        .expect("streamed text mutex")
-                        .push_str(&text);
+            match delta {
+                AgentDelta::TextDelta(text) => {
+                    {
+                        streamed_fwd
+                            .lock()
+                            .expect("streamed text mutex")
+                            .push_str(&text);
+                    }
+                    sink.emit(AguiEvent::TextMessageContent {
+                        message_id: msg_id.to_string(),
+                        delta: text,
+                    })
+                    .await?;
                 }
-                sink.emit(AguiEvent::TextMessageContent {
-                    message_id: msg_id.to_string(),
-                    delta: text,
-                })
-                .await?;
+                // The model's reasoning streams as a distinct THINKING event so
+                // the UI can show the plan/work without it entering the answer.
+                AgentDelta::ReasoningDelta(text) => {
+                    sink.emit(AguiEvent::ThinkingContent {
+                        message_id: msg_id.to_string(),
+                        delta: text,
+                    })
+                    .await?;
+                }
+                _ => {}
             }
         }
         Ok::<(), Error>(())

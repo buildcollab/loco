@@ -137,7 +137,11 @@ pub async fn execute(
         scope: conversation.scope.clone(),
         extensions: agent.extensions(ctx, &args.principal),
     };
-    let system = agent.system_prompt(&actx).await?;
+    let mut system = agent.system_prompt(&actx).await?;
+    if let Some(plan) = agent.planner(&actx) {
+        system.push_str("\n\n# Planning\n");
+        system.push_str(&plan);
+    }
     let authz = agent.authorizer(&actx);
     let tokens = agent.token_resolver(&actx);
     let embedder = agent.embedder(&actx);

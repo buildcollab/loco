@@ -97,6 +97,11 @@ pub enum AguiEvent {
     /// shallow merge-patch object applied over the current state.
     #[serde(rename = "STATE_DELTA", rename_all = "camelCase")]
     StateDelta { delta: Value },
+
+    /// A chunk of the model's reasoning ("thinking"), streamed distinctly from
+    /// the assistant answer so the UI can show the agent's plan/work.
+    #[serde(rename = "THINKING_CONTENT", rename_all = "camelCase")]
+    ThinkingContent { message_id: String, delta: String },
 }
 
 /// Terminal outcome of a run.
@@ -171,6 +176,7 @@ impl AguiEvent {
             Self::Custom { .. } => "CUSTOM",
             Self::StateSnapshot { .. } => "STATE_SNAPSHOT",
             Self::StateDelta { .. } => "STATE_DELTA",
+            Self::ThinkingContent { .. } => "THINKING_CONTENT",
         }
     }
 }
@@ -200,6 +206,24 @@ pub fn part_tool_result(tool_call_id: &str, status: &str, content: &Value) -> Va
         "toolCallId": tool_call_id,
         "status": status,
         "content": content,
+    })
+}
+
+/// A "thinking" message part (the model's persisted reasoning).
+#[must_use]
+pub fn part_thinking(text: &str) -> Value {
+    json!({ "type": "thinking", "text": text })
+}
+
+/// A "citation" message part linking an answer to a source (a memory/artifact id
+/// or URL) — provenance the UI can render inline.
+#[must_use]
+pub fn part_citation(text: &str, source: &str, url: Option<&str>) -> Value {
+    json!({
+        "type": "citation",
+        "text": text,
+        "source": source,
+        "url": url,
     })
 }
 
