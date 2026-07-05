@@ -33,6 +33,22 @@ pub struct DbStore {
     pub conversation_id: i32,
 }
 
+/// Is `m` the current turn's not-yet-written assistant placeholder?
+///
+/// `run_turn` inserts a `"streaming"` assistant row before loading history, so
+/// this catches that row (empty `parts` *and* empty `content`) without dropping
+/// an interrupt-finalized `"streaming"` row, which always carries `parts`.
+fn is_empty_streaming(m: &messages::Model) -> bool {
+    let is_streaming = m.status.as_deref() == Some("streaming");
+    let has_parts = m
+        .parts
+        .as_ref()
+        .and_then(Value::as_array)
+        .is_some_and(|a| !a.is_empty());
+    let has_content = m.content.as_deref().is_some_and(|c| !c.is_empty());
+    is_streaming && !has_parts && !has_content
+}
+
 impl DbStore {
     /// Build a store bound to `conversation_id` on `db`.
     #[must_use]
@@ -61,10 +77,18 @@ impl ConversationStore for DbStore {
             .all(&self.db)
             .await?;
         rows.sort_by_key(|m| m.id);
+        // `run_turn` inserts the assistant row (status `"streaming"`) *before*
+        // calling `load_history`, so the current turn's still-empty placeholder
+        // is present here. Replaying it would inject a spurious empty assistant
+        // turn into the provider prompt. Skip in-progress rows that carry no
+        // content yet, while keeping interrupt-finalized `"streaming"` rows —
+        // those already hold `parts` (e.g. a `tool_use`) that `resume` needs.
         // Lossless: rebuild tool_use / tool_result context from the persisted
         // `parts`, falling back to plain `content` for rows without parts.
         Ok(history_from_parts(
-            rows.into_iter().map(|m| (m.role, m.parts, m.content)),
+            rows.into_iter()
+                .filter(|m| !is_empty_streaming(m))
+                .map(|m| (m.role, m.parts, m.content)),
         ))
     }
 
@@ -473,5 +497,67 @@ impl MemoryStore for DbMemoryStore {
         scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(top_k.max(1));
         Ok(scored)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg(role: &str, status: Option<&str>, parts: Option<Value>, content: Option<&str>) -> messages::Model {
+        messages::Model {
+            id: 1,
+            pid: Uuid::nil(),
+            conversation_id: 1,
+            role: role.to_string(),
+            content: content.map(str::to_string),
+            parts,
+            provider: None,
+            model: None,
+            usage: None,
+            status: status.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn skips_the_fresh_streaming_placeholder() {
+        // `run_turn` inserts this (status "streaming", no parts, no content)
+        // before `load_history`; replaying it injects an empty assistant turn.
+        assert!(is_empty_streaming(&msg("assistant", Some("streaming"), None, None)));
+        // An empty `parts` array is just as empty as a missing one.
+        assert!(is_empty_streaming(&msg(
+            "assistant",
+            Some("streaming"),
+            Some(json!([])),
+            None
+        )));
+    }
+
+    #[test]
+    fn keeps_interrupt_finalized_streaming_row() {
+        // The approval/interrupt path finalizes the assistant row as still
+        // "streaming" but with real `parts` (a tool_use `resume` must replay).
+        let parts = json!([{ "type": "tool_use", "toolCallId": "c1", "name": "x", "input": {} }]);
+        assert!(!is_empty_streaming(&msg(
+            "assistant",
+            Some("streaming"),
+            Some(parts),
+            None
+        )));
+    }
+
+    #[test]
+    fn keeps_completed_and_empty_rows() {
+        // Completed rows are never touched, even when empty (a model that
+        // genuinely returned nothing).
+        assert!(!is_empty_streaming(&msg("assistant", Some("complete"), None, Some(""))));
+        assert!(!is_empty_streaming(&msg("user", Some("complete"), None, Some("hi"))));
+        // A streaming row that already streamed some text stays.
+        assert!(!is_empty_streaming(&msg(
+            "assistant",
+            Some("streaming"),
+            None,
+            Some("partial")
+        )));
     }
 }

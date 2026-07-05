@@ -17,13 +17,41 @@
 //! the [`service`](crate::agui::service) helpers from its own controller.
 
 use async_trait::async_trait;
-use sea_orm::{ColumnTrait, Condition};
+use sea_orm::sea_query::{extension::postgres::PgBinOper, Expr};
+use sea_orm::{ColumnTrait, Condition, ExprTrait};
 use serde_json::Value;
 
 use super::agent::Principal;
 use super::entities::conversations;
 use crate::app::AppContext;
 use crate::Result;
+
+/// A Postgres JSONB-containment (`@>`) condition: select rows whose `column`
+/// *contains* every key/value in `subset`.
+///
+/// The default [`ScopeResolver::filter`] matches the scope column *exactly*,
+/// which is the right default (portable, and an exact tenant match is the
+/// common case). It is too strict, though, when a conversation is stamped with
+/// a rich scope (e.g. `{organization_id, project_id}`) but must also be visible
+/// to a coarser query — an org-wide history rail that filters on just
+/// `{organization_id}`. Override `filter` with this helper to get that:
+///
+/// ```ignore
+/// use loco_rs::agui::scope;
+/// # use loco_rs::agui::entities::conversations;
+/// # use sea_orm::Condition; use serde_json::Value;
+/// fn filter(&self, scope: &Value) -> Condition {
+///     scope::contains(conversations::Column::Scope, scope)
+/// }
+/// ```
+///
+/// Postgres-only: `@>` is not portable to SQLite/MySQL. Pair it with the GIN
+/// index the generated agent migration builds on the `scope` columns so the
+/// containment probe stays index-backed instead of seq-scanning at scale.
+#[must_use]
+pub fn contains<C: ColumnTrait>(column: C, subset: &Value) -> Condition {
+    Condition::all().add(Expr::col(column).binary(PgBinOper::Contains, Expr::val(subset.clone())))
+}
 
 /// Computes the tenancy scope for a request and the DB filter that restricts
 /// which conversations a request may see.
@@ -46,8 +74,9 @@ pub trait ScopeResolver: Send + Sync {
 
     /// The DB condition selecting conversations visible under `scope`. The
     /// default matches rows whose `scope` column equals `scope` exactly;
-    /// override for JSON-containment (e.g. Postgres `scope @> ..`) or for a
-    /// relational scheme where the app added its own columns.
+    /// override for JSON-containment (Postgres `scope @> ..`, via the
+    /// [`contains`] helper) or for a relational scheme where the app added its
+    /// own columns.
     fn filter(&self, scope: &Value) -> Condition {
         Condition::all().add(conversations::Column::Scope.eq(scope.clone()))
     }
@@ -67,5 +96,24 @@ impl ScopeResolver for NoScope {
         _principal: &Principal,
     ) -> Result<Option<Value>> {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sea_orm::{DatabaseBackend, EntityTrait, QueryFilter, QueryTrait};
+    use serde_json::json;
+
+    use super::{conversations, contains};
+
+    #[test]
+    fn contains_builds_jsonb_containment_sql() {
+        let cond = contains(conversations::Column::Scope, &json!({"organization_id": 7}));
+        let sql = conversations::Entity::find()
+            .filter(cond)
+            .build(DatabaseBackend::Postgres)
+            .to_string();
+        assert!(sql.contains("@>"), "expected JSONB containment, got: {sql}");
+        assert!(sql.contains("scope"), "should filter the scope column: {sql}");
     }
 }
