@@ -42,6 +42,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::agui::agent::{AgentHooks, NoopHooks, RunCtx};
+use crate::agui::context::ToolContext;
+use crate::agui::guardrail::{BudgetLimiter, Guardrail, NoGuardrail, Unlimited};
 use crate::agui::protocol::{
     part_text, part_tool_result, part_tool_use, AguiEvent, Interrupt, ResumeItem, RunOutcome,
 };
@@ -55,6 +57,10 @@ use crate::{Error, Result};
 /// Key under which a bubbled-up subagent's suspended state is stashed in the
 /// parent pending delegation call's arguments (so `resume` can route back).
 const SUBAGENT_STATE_KEY: &str = "__subagent_state";
+
+/// Name of the built-in tool whose approval interrupt is answered by the user's
+/// free-text `input` on resume (rather than by re-executing the tool).
+pub const ASK_USER_TOOL: &str = "ask_user";
 
 /// Handle to a persisted message, identified by its public id (used verbatim in
 /// emitted events).
@@ -84,12 +90,13 @@ pub trait ToolExecutor: Send + Sync {
     /// The tools available this run (name, schema, read/write kind).
     fn specs(&self) -> Vec<ToolSpec>;
 
-    /// Execute a tool by name.
+    /// Execute a tool by name, with the run's [`ToolContext`] (app deps,
+    /// principal, scope, token resolver, artifact store, custom deps).
     ///
     /// # Errors
     /// Tool failures surface as `Err`; the run-loop records them as an `error`
     /// tool result and continues.
-    async fn execute(&self, name: &str, args: Value) -> Result<Value>;
+    async fn execute(&self, ctx: &ToolContext, name: &str, args: Value) -> Result<Value>;
 }
 
 /// The outcome of an authorization check for a single tool call.
@@ -149,8 +156,8 @@ impl<T: ?Sized + ToolExecutor> ToolExecutor for Box<T> {
     fn specs(&self) -> Vec<ToolSpec> {
         (**self).specs()
     }
-    async fn execute(&self, name: &str, args: Value) -> Result<Value> {
-        (**self).execute(name, args).await
+    async fn execute(&self, ctx: &ToolContext, name: &str, args: Value) -> Result<Value> {
+        (**self).execute(ctx, name, args).await
     }
 }
 
@@ -161,8 +168,8 @@ impl<T: ?Sized + ToolExecutor> ToolExecutor for Arc<T> {
     fn specs(&self) -> Vec<ToolSpec> {
         (**self).specs()
     }
-    async fn execute(&self, name: &str, args: Value) -> Result<Value> {
-        (**self).execute(name, args).await
+    async fn execute(&self, ctx: &ToolContext, name: &str, args: Value) -> Result<Value> {
+        (**self).execute(ctx, name, args).await
     }
 }
 
@@ -249,6 +256,17 @@ pub struct RunParams {
     /// Lifecycle hooks fired around the run / each turn / each tool call.
     /// Defaults to a no-op; a trait object to avoid another run-loop generic.
     pub hooks: Arc<dyn AgentHooks>,
+    /// The context handed to every tool call (app deps, principal, scope, token
+    /// resolver, artifact store, custom deps). Cloned into each tool's task.
+    /// Defaults to a detached context (no app) for subagent / test runs.
+    pub tool_ctx: ToolContext,
+    /// Inspect/rewrite model input & output, or block the run. Defaults to a
+    /// no-op. Applied before each turn (system + history) and after a final
+    /// answer (text).
+    pub guardrail: Arc<dyn Guardrail>,
+    /// Per-turn spend cap keyed on `tool_ctx.scope` + accumulated usage. Defaults
+    /// to unlimited.
+    pub budget: Arc<dyn BudgetLimiter>,
     /// Cooperative cancellation for an explicit "stop". The loop polls this
     /// between turns and around tool calls, and races it during streaming; on
     /// cancel it persists partial output and finalizes as `"cancelled"`.
@@ -266,6 +284,9 @@ impl Default for RunParams {
             max_tool_turns: 8,
             tool_timeout: None,
             hooks: Arc::new(NoopHooks),
+            tool_ctx: ToolContext::default(),
+            guardrail: Arc::new(NoGuardrail),
+            budget: Arc::new(Unlimited),
             cancel: CancellationToken::new(),
         }
     }
@@ -709,7 +730,15 @@ where
                 .iter()
                 .find(|s| s.name == call.name)
                 .map_or(ToolKind::Write, |s| s.kind);
-            let (status, result) = match authz.authorize(&call, kind).await? {
+            let (status, result) = if call.name == ASK_USER_TOOL {
+                // An `ask_user` interrupt is answered by resume input, not by
+                // re-executing the tool: the user's reply becomes its result.
+                let answer = item.payload.input.clone().unwrap_or(Value::Null);
+                let r = json!({ "answer": answer });
+                store.complete_tool_call(&tref, "success", &r, 0).await?;
+                ("success", r)
+            } else {
+                match authz.authorize(&call, kind).await? {
                 ToolDecision::Deny { reason } => {
                     let denied = json!({ "denied": true, "reason": reason });
                     store
@@ -721,10 +750,18 @@ where
                 // repeated `RequireApproval` as an allow rather than looping.
                 ToolDecision::Allow | ToolDecision::RequireApproval { .. } => {
                     params.hooks.before_tool(&ctx, &call).await?;
-                    let (s, r) =
-                        execute_and_record(&exec, store, &tref, &call, params.tool_timeout).await?;
+                    let (s, r) = execute_and_record(
+                        &exec,
+                        store,
+                        &tref,
+                        &call,
+                        &params.tool_ctx,
+                        params.tool_timeout,
+                    )
+                    .await?;
                     params.hooks.after_tool(&ctx, &call, &r).await?;
                     (s, r)
+                }
                 }
             };
             parts.push(part_tool_use(&call.id, &call.name, &call.arguments));
@@ -914,17 +951,27 @@ where
     K: EventSink,
     A: ToolAuthorizer,
 {
+    // The guardrail may rewrite the system prompt, so work on a local copy.
+    let mut system = params.system.clone();
     for _turn in 0..params.max_tool_turns.max(1) {
         // Cancellation is cooperative: bail out at each turn boundary.
         if params.cancel.is_cancelled() {
             return Ok(LoopResult::Cancelled);
         }
 
+        // Budget check + input guardrail before spending a provider turn. Both
+        // may abort the run with an `Err` (surfaced as `RUN_ERROR`).
+        params
+            .budget
+            .check(params.tool_ctx.scope.as_ref(), total_usage)
+            .await?;
+        params.guardrail.on_input(&mut system, history).await?;
+
         params.hooks.before_message(ctx).await?;
         let outcome = match stream_one_turn(
             provider,
             sink,
-            &params.system,
+            &system,
             &msg.id,
             history,
             specs,
@@ -944,8 +991,11 @@ where
         params.hooks.after_message(ctx, &outcome).await?;
 
         match outcome {
-            TurnOutcome::Final { text, usage } => {
+            TurnOutcome::Final { mut text, usage } => {
                 total_usage.add(&usage);
+                // Output guardrail: moderate/redact the final answer before it is
+                // persisted (streamed deltas already went out live).
+                params.guardrail.on_output(&mut text).await?;
                 if !text.is_empty() {
                     parts.push(part_text(&text));
                 }
@@ -1126,8 +1176,15 @@ where
                     })
                     .await?;
 
-                    let (status, result) =
-                        execute_and_record(exec, store, &tref, call, params.tool_timeout).await?;
+                    let (status, result) = execute_and_record(
+                        exec,
+                        store,
+                        &tref,
+                        call,
+                        &params.tool_ctx,
+                        params.tool_timeout,
+                    )
+                    .await?;
                     params.hooks.after_tool(ctx, call, &result).await?;
                     sink.emit(AguiEvent::ToolCallResult {
                         message_id: msg.id.clone(),
@@ -1208,6 +1265,7 @@ async fn execute_and_record<E, S>(
     store: &S,
     tref: &ToolRef,
     call: &ToolCallReq,
+    tool_ctx: &ToolContext,
     timeout: Option<Duration>,
 ) -> Result<(&'static str, Value)>
 where
@@ -1219,7 +1277,10 @@ where
         let exec = Arc::clone(exec);
         let name = call.name.clone();
         let args = call.arguments.clone();
-        async move { exec.execute(&name, args).await }
+        // The tool runs on its own task, so the context must be owned there;
+        // `ToolContext` is `Clone` (all-owned/`Arc` fields) for exactly this.
+        let ctx = tool_ctx.clone();
+        async move { exec.execute(&ctx, &name, args).await }
     });
     let guard = AbortOnDrop(handle);
 
@@ -1414,18 +1475,30 @@ where
     let streamed_fwd = Arc::clone(&streamed);
     let forward_fut = async move {
         while let Some(delta) = drx.recv().await {
-            if let AgentDelta::TextDelta(text) = delta {
-                {
-                    streamed_fwd
-                        .lock()
-                        .expect("streamed text mutex")
-                        .push_str(&text);
+            match delta {
+                AgentDelta::TextDelta(text) => {
+                    {
+                        streamed_fwd
+                            .lock()
+                            .expect("streamed text mutex")
+                            .push_str(&text);
+                    }
+                    sink.emit(AguiEvent::TextMessageContent {
+                        message_id: msg_id.to_string(),
+                        delta: text,
+                    })
+                    .await?;
                 }
-                sink.emit(AguiEvent::TextMessageContent {
-                    message_id: msg_id.to_string(),
-                    delta: text,
-                })
-                .await?;
+                // The model's reasoning streams as a distinct THINKING event so
+                // the UI can show the plan/work without it entering the answer.
+                AgentDelta::ReasoningDelta(text) => {
+                    sink.emit(AguiEvent::ThinkingContent {
+                        message_id: msg_id.to_string(),
+                        delta: text,
+                    })
+                    .await?;
+                }
+                _ => {}
             }
         }
         Ok::<(), Error>(())
@@ -1640,7 +1713,7 @@ mod tests {
                 },
             ]
         }
-        async fn execute(&self, name: &str, _args: Value) -> Result<Value> {
+        async fn execute(&self, _ctx: &ToolContext, name: &str, _args: Value) -> Result<Value> {
             Ok(json!({ "ok": name }))
         }
     }
@@ -1940,7 +2013,7 @@ mod tests {
         let resume_sink = VecSink::default();
         let item = ResumeItem {
             interrupt_id: "call_stub_save_note".to_string(),
-            payload: ResumePayload { approved: true },
+            payload: ResumePayload { approved: true, input: None },
         };
         resume(
             &store,
@@ -1990,7 +2063,7 @@ mod tests {
         let resume_sink = VecSink::default();
         let item = ResumeItem {
             interrupt_id: "call_stub_save_note".to_string(),
-            payload: ResumePayload { approved: false },
+            payload: ResumePayload { approved: false, input: None },
         };
         resume(
             &store,
@@ -2155,7 +2228,7 @@ mod tests {
                 kind: ToolKind::Write,
             }]
         }
-        async fn execute(&self, name: &str, _args: Value) -> Result<Value> {
+        async fn execute(&self, _ctx: &ToolContext, name: &str, _args: Value) -> Result<Value> {
             Ok(json!({ "saved": name }))
         }
     }
@@ -2215,7 +2288,7 @@ mod tests {
         let resume_sink = VecSink::default();
         let item = ResumeItem {
             interrupt_id: "del_1".to_string(),
-            payload: ResumePayload { approved: true },
+            payload: ResumePayload { approved: true, input: None },
         };
         resume_with_subagents(
             &store,
@@ -2269,7 +2342,7 @@ mod tests {
         let resume_sink = VecSink::default();
         let item = ResumeItem {
             interrupt_id: "del_1".to_string(),
-            payload: ResumePayload { approved: false },
+            payload: ResumePayload { approved: false, input: None },
         };
         resume_with_subagents(
             &store,
@@ -2308,7 +2381,7 @@ mod tests {
                 kind: ToolKind::Read,
             }]
         }
-        async fn execute(&self, _name: &str, _args: Value) -> Result<Value> {
+        async fn execute(&self, _ctx: &ToolContext, _name: &str, _args: Value) -> Result<Value> {
             panic!("kaboom");
         }
     }
@@ -2366,7 +2439,7 @@ mod tests {
                 kind: ToolKind::Read,
             }]
         }
-        async fn execute(&self, _name: &str, _args: Value) -> Result<Value> {
+        async fn execute(&self, _ctx: &ToolContext, _name: &str, _args: Value) -> Result<Value> {
             tokio::time::sleep(Duration::from_millis(500)).await;
             Ok(json!({ "ok": true }))
         }

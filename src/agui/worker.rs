@@ -43,12 +43,20 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::agent::{AgentCtx, AgentRegistry, Principal};
+use super::artifact::builtin_artifact_tools;
+use super::context::{ArtifactStore, MemoryStore};
+use super::context_tool::builtin_context_tools;
 use super::entities::conversations;
 use super::hub::{run_hub, HubSink};
-use super::protocol::RunAgentInput;
+use super::interact::builtin_interact_tools;
+use super::memory::builtin_memory_tools;
+use super::protocol::{AguiEvent, RunAgentInput};
+use super::state_tool::builtin_state_tools;
+use super::transport::EventSink;
 use super::runtime::{resume, run_turn, ConversationStore, RunParams};
 use super::service;
-use super::store::DbStore;
+use super::store::{DbArtifactStore, DbMemoryStore, DbStore};
+use super::subagent::CompositeToolExecutor;
 use crate::app::AppContext;
 use crate::bgworker::BackgroundWorker;
 use crate::config::{ExecutionConfig, WorkerMode};
@@ -117,17 +125,87 @@ pub async fn execute(
     let store = DbStore::new(ctx.db.clone(), conversation.id);
     seed_turn(&store, &args.input).await?;
 
+    // Rebuild all request-scoped dependencies here, on the *executing* node,
+    // from the app context + the (serialized) principal + the persisted
+    // conversation row. Nothing below crosses a durable job payload, so inline
+    // and worker execution behave identically and tokens are always fresh.
     let actx = AgentCtx {
         app: ctx,
         thread_id: conversation.pid.to_string(),
+        conversation_id: conversation.id,
         mode: conversation.mode.clone(),
         principal: args.principal.clone(),
+        scope: conversation.scope.clone(),
+        extensions: agent.extensions(ctx, &args.principal),
     };
-    let system = agent.system_prompt(&actx).await?;
+    let mut system = agent.system_prompt(&actx).await?;
+    if let Some(plan) = agent.planner(&actx) {
+        system.push_str("\n\n# Planning\n");
+        system.push_str(&plan);
+    }
     let authz = agent.authorizer(&actx);
+    let tokens = agent.token_resolver(&actx);
+    let embedder = agent.embedder(&actx);
+    let guardrail = agent.guardrail(&actx);
+    let budget = agent.budget(&actx);
     let hooks = agent.hooks();
-    let tools = Arc::new(agent.tools());
-    let provider = service::provider(ctx, &agent.model());
+    let mut provider = service::provider(ctx, &agent.model());
+    // Structured output: constrain the answer to the agent's response schema.
+    if let Some(schema) = agent.response_schema(&actx) {
+        provider = provider.with_response_format(schema);
+    }
+
+    let hub = run_hub(ctx);
+    let sink: Arc<HubSink> = Arc::new(HubSink::new(hub.clone(), args.run_id.clone()));
+
+    // The run's tool context: app deps, principal, scope, token resolver, the
+    // (hub) event sink so tools can emit `CUSTOM` events, and the conversation's
+    // artifact store.
+    let artifacts: Arc<dyn ArtifactStore> =
+        Arc::new(DbArtifactStore::new(ctx.db.clone(), conversation.id));
+    let memory: Arc<dyn MemoryStore> = Arc::new(DbMemoryStore::new(
+        ctx.db.clone(),
+        conversation.scope.clone(),
+        Some(conversation.id),
+        embedder,
+    ));
+    let tool_ctx = actx
+        .tool_context(args.run_id.clone())
+        .with_tokens(tokens)
+        .with_sink(sink.clone())
+        .with_artifacts(artifacts)
+        .with_memory(memory);
+
+    // The agent's own tools plus the framework's built-in artifact / context /
+    // memory tools. App tools win on any name collision (first-registered wins).
+    let tools = Arc::new(
+        CompositeToolExecutor::default()
+            .with(agent.tools())
+            .with(builtin_artifact_tools())
+            .with(builtin_context_tools())
+            .with(builtin_memory_tools())
+            .with(builtin_state_tools())
+            .with(builtin_interact_tools()),
+    );
+
+    // Auto-title a fresh conversation from its first user message (cheap
+    // heuristic — no extra model call).
+    if conversation.title.is_none() {
+        if let Some(msg) = &args.input.message {
+            let title: String = msg.trim().chars().take(60).collect();
+            if !title.is_empty() {
+                let _ = service::set_title(&ctx.db, conversation.id, &title).await;
+            }
+        }
+    }
+
+    // Stream the current shared state so a connecting client can render it
+    // before the run produces any deltas.
+    if let Some(state) = conversation.state.clone() {
+        let _ = sink
+            .emit(AguiEvent::StateSnapshot { snapshot: state })
+            .await;
+    }
 
     let params = RunParams {
         system,
@@ -138,15 +216,16 @@ pub async fn execute(
         max_tool_turns: 8,
         tool_timeout: None,
         hooks,
+        tool_ctx,
+        guardrail,
+        budget,
         cancel,
     };
 
-    let hub = run_hub(ctx);
-    let sink = HubSink::new(hub.clone(), args.run_id.clone());
     let result = if let Some(item) = args.input.resume.first().cloned() {
-        resume(&store, tools, &provider, &sink, &params, &authz, &item).await
+        resume(&store, tools, &provider, sink.as_ref(), &params, &authz, &item).await
     } else {
-        run_turn(&store, tools, &provider, &sink, &params, &authz).await
+        run_turn(&store, tools, &provider, sink.as_ref(), &params, &authz).await
     };
     if let Err(err) = &result {
         tracing::error!(target: "loco_rs::agui", error = %err, run_id = %args.run_id, "agent run failed");
@@ -248,9 +327,15 @@ pub struct StartedRun {
 ///     "report_writer",
 ///     "Generate the Q3 sales report",
 ///     Principal::default(),
+///     None, // or Some(json!({ "organization_id": 42 })) to tenant the run
 /// ).await?;
 /// // later: read `messages` for conversation `run.conversation_pid`
 /// ```
+///
+/// `scope` is the tenancy value stamped on the opened conversation (the same
+/// value a request-driven [`ScopeResolver`](super::scope::ScopeResolver) would
+/// produce), so headless/offline runs are tenanted identically to HTTP ones and
+/// the executing node reads it back off the row.
 ///
 /// # Errors
 /// Returns [`Error::NotFound`] if `agent_id` is not in the registry; otherwise
@@ -261,6 +346,7 @@ pub async fn start_run(
     agent_id: &str,
     message: impl Into<String>,
     principal: Principal,
+    scope: Option<serde_json::Value>,
 ) -> Result<StartedRun> {
     if registry.get(agent_id).is_none() {
         return Err(Error::NotFound);
@@ -270,6 +356,7 @@ pub async fn start_run(
         pid: Set(pid),
         agent_id: Set(agent_id.to_string()),
         status: Set(Some("idle".to_string())),
+        scope: Set(scope),
         ..Default::default()
     }
     .insert(&ctx.db)
@@ -406,7 +493,7 @@ mod tests {
             message: None,
             resume: vec![ResumeItem {
                 interrupt_id: "i1".to_string(),
-                payload: ResumePayload { approved: true },
+                payload: ResumePayload { approved: true, input: None },
             }],
         };
         seed_turn(&store, &resume).await.unwrap();

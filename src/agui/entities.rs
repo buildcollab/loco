@@ -32,6 +32,17 @@ pub mod conversations {
         pub status: Option<String>,
         /// The in-flight run id, so a client can resume or cancel it.
         pub active_run_id: Option<String>,
+        /// App-defined tenancy value (e.g. `{organization_id, project_id}`), set
+        /// by the controller at create and used to scope reads. `NULL` = unscoped.
+        #[sea_orm(column_type = "JsonBinary", nullable)]
+        pub scope: Option<Json>,
+        /// Free-form app extensibility slot for non-scoping data.
+        #[sea_orm(column_type = "JsonBinary", nullable)]
+        pub metadata: Option<Json>,
+        /// Shared, evolving run state (AG-UI `STATE_SNAPSHOT` / `STATE_DELTA`):
+        /// structured working memory the agent updates and the UI reflects live.
+        #[sea_orm(column_type = "JsonBinary", nullable)]
+        pub state: Option<Json>,
     }
 
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -111,6 +122,9 @@ pub mod context_items {
         #[sea_orm(unique)]
         pub pid: Uuid,
         pub conversation_id: i32,
+        /// Optional message this context item is attached to (message-scoped
+        /// context/attachments). `NULL` = conversation-scoped.
+        pub message_id: Option<i32>,
         pub kind: String,
         pub name: String,
         pub reference: Option<String>,
@@ -167,6 +181,71 @@ pub mod agent_events {
         pub name: String,
         #[sea_orm(column_type = "JsonBinary", nullable)]
         pub payload: Option<Json>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod memories {
+    //! Long-term, retrievable memory (RAG). Scoped by tenant (`scope`) and/or a
+    //! conversation; `embedding` holds a JSON array of floats when an embedder is
+    //! configured, else search falls back to lexical ranking.
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize)]
+    #[sea_orm(table_name = "memories")]
+    pub struct Model {
+        #[sea_orm(primary_key)]
+        pub id: i32,
+        #[sea_orm(unique)]
+        pub pid: Uuid,
+        /// Tenant scope (matches `conversations.scope`); `NULL` = global.
+        #[sea_orm(column_type = "JsonBinary", nullable)]
+        pub scope: Option<Json>,
+        /// Optional owning conversation; `NULL` = tenant/global memory.
+        pub conversation_id: Option<i32>,
+        pub kind: Option<String>,
+        #[sea_orm(column_type = "Text")]
+        pub content: String,
+        #[sea_orm(column_type = "JsonBinary", nullable)]
+        pub embedding: Option<Json>,
+        #[sea_orm(column_type = "JsonBinary", nullable)]
+        pub metadata: Option<Json>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod artifacts {
+    //! A persistent deliverable (document / report) the agent produced, scoped to
+    //! a conversation. Fetchable for display and mutable by the built-in artifact
+    //! tools.
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, serde::Serialize)]
+    #[sea_orm(table_name = "artifacts")]
+    pub struct Model {
+        #[sea_orm(primary_key)]
+        pub id: i32,
+        #[sea_orm(unique)]
+        pub pid: Uuid,
+        pub conversation_id: i32,
+        pub name: String,
+        pub kind: Option<String>,
+        pub content: Option<String>,
+        pub reference: Option<String>,
+        /// Free-form tags (JSON array of strings) for organizing/fetching.
+        #[sea_orm(column_type = "JsonBinary", nullable)]
+        pub tags: Option<Json>,
+        #[sea_orm(column_type = "JsonBinary", nullable)]
+        pub metadata: Option<Json>,
+        pub version: i32,
     }
 
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

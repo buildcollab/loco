@@ -10,7 +10,7 @@
 //! payload into a clean, model-visible error rather than a silent mismatch.
 //!
 //! ```ignore
-//! use loco_rs::agui::{Tool, Tools, ToolSpec, ToolKind};
+//! use loco_rs::agui::{Tool, ToolContext, Tools, ToolSpec, ToolKind};
 //! use serde::Deserialize;
 //! use serde_json::{json, Value};
 //!
@@ -33,7 +33,7 @@
 //!             kind: ToolKind::Write,
 //!         }
 //!     }
-//!     async fn call(&self, args: SaveMemo) -> loco_rs::Result<Value> {
+//!     async fn call(&self, _ctx: &ToolContext, args: SaveMemo) -> loco_rs::Result<Value> {
 //!         Ok(json!({ "saved": true, "text": args.text }))
 //!     }
 //! }
@@ -46,6 +46,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::agui::context::ToolContext;
 use crate::agui::provider::ToolSpec;
 use crate::agui::runtime::ToolExecutor;
 use crate::{Error, Result};
@@ -65,12 +66,14 @@ pub trait Tool: Send + Sync {
     /// `specs()` and its dispatch table from it.
     fn spec(&self) -> ToolSpec;
 
-    /// Run the tool with typed, validated arguments.
+    /// Run the tool with the run's [`ToolContext`] (app deps, principal, scope,
+    /// token resolver, artifact store, custom deps) and typed, validated
+    /// arguments.
     ///
     /// # Errors
     /// Tool failures surface as `Err`; the run-loop records them as an `error`
     /// tool result the model sees, and continues.
-    async fn call(&self, args: Self::Args) -> Result<Value>;
+    async fn call(&self, ctx: &ToolContext, args: Self::Args) -> Result<Value>;
 }
 
 /// Arguments type for a tool that takes none. Deserializes from `{}` (and from
@@ -82,7 +85,7 @@ pub struct NoArgs {}
 #[async_trait]
 trait ErasedTool: Send + Sync {
     fn spec(&self) -> ToolSpec;
-    async fn call_raw(&self, args: Value) -> Result<Value>;
+    async fn call_raw(&self, ctx: &ToolContext, args: Value) -> Result<Value>;
 }
 
 struct ToolHolder<T: Tool>(T);
@@ -93,7 +96,7 @@ impl<T: Tool> ErasedTool for ToolHolder<T> {
         self.0.spec()
     }
 
-    async fn call_raw(&self, args: Value) -> Result<Value> {
+    async fn call_raw(&self, ctx: &ToolContext, args: Value) -> Result<Value> {
         // Tools with no parameters are frequently called with `null`; treat it
         // as an empty object so `NoArgs`-style structs deserialize.
         let args = if args.is_null() { json!({}) } else { args };
@@ -103,7 +106,7 @@ impl<T: Tool> ErasedTool for ToolHolder<T> {
                 self.0.spec().name
             ))
         })?;
-        self.0.call(parsed).await
+        self.0.call(ctx, parsed).await
     }
 }
 
@@ -157,10 +160,10 @@ impl ToolExecutor for Tools {
         self.tools.iter().map(|t| t.spec()).collect()
     }
 
-    async fn execute(&self, name: &str, args: Value) -> Result<Value> {
+    async fn execute(&self, ctx: &ToolContext, name: &str, args: Value) -> Result<Value> {
         for tool in &self.tools {
             if tool.spec().name == name {
-                return tool.call_raw(args).await;
+                return tool.call_raw(ctx, args).await;
             }
         }
         Err(Error::Message(format!("unknown tool: {name}")))
@@ -193,7 +196,7 @@ mod tests {
                 kind: ToolKind::Read,
             }
         }
-        async fn call(&self, args: EchoArgs) -> Result<Value> {
+        async fn call(&self, _ctx: &ToolContext, args: EchoArgs) -> Result<Value> {
             Ok(json!({ "echoed": args.text }))
         }
     }
@@ -210,7 +213,7 @@ mod tests {
                 kind: ToolKind::Read,
             }
         }
-        async fn call(&self, _args: NoArgs) -> Result<Value> {
+        async fn call(&self, _ctx: &ToolContext, _args: NoArgs) -> Result<Value> {
             Ok(json!({ "pong": true }))
         }
     }
@@ -218,25 +221,27 @@ mod tests {
     #[tokio::test]
     async fn derives_specs_and_dispatches() {
         let tools = Tools::new().with(EchoTool).with(PingTool);
+        let ctx = ToolContext::default();
         let names: Vec<String> = tools.specs().into_iter().map(|s| s.name).collect();
         assert_eq!(names, vec!["echo".to_string(), "ping".to_string()]);
 
         let out = tools
-            .execute("echo", json!({ "text": "hi" }))
+            .execute(&ctx, "echo", json!({ "text": "hi" }))
             .await
             .unwrap();
         assert_eq!(out, json!({ "echoed": "hi" }));
 
         // no-arg tool called with null args
-        let out = tools.execute("ping", Value::Null).await.unwrap();
+        let out = tools.execute(&ctx, "ping", Value::Null).await.unwrap();
         assert_eq!(out, json!({ "pong": true }));
     }
 
     #[tokio::test]
     async fn bad_args_are_a_clean_error() {
         let tools = Tools::new().with(EchoTool);
+        let ctx = ToolContext::default();
         // Missing required `text` → deserialize error, surfaced (not a panic).
-        let err = tools.execute("echo", json!({})).await.unwrap_err();
+        let err = tools.execute(&ctx, "echo", json!({})).await.unwrap_err();
         assert!(err
             .to_string()
             .contains("invalid arguments for tool 'echo'"));
@@ -245,7 +250,8 @@ mod tests {
     #[tokio::test]
     async fn unknown_tool_errors() {
         let tools = Tools::new().with(EchoTool);
-        let err = tools.execute("nope", json!({})).await.unwrap_err();
+        let ctx = ToolContext::default();
+        let err = tools.execute(&ctx, "nope", json!({})).await.unwrap_err();
         assert!(err.to_string().contains("unknown tool"));
     }
 }

@@ -10,7 +10,7 @@ skip_exists: true
 //! keep in sync.
 
 use async_trait::async_trait;
-use loco_rs::agui::{NoArgs, Tool, ToolKind, ToolSpec, Tools};
+use loco_rs::agui::{NoArgs, Tool, ToolContext, ToolKind, ToolSpec, Tools};
 use loco_rs::prelude::*;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -37,7 +37,7 @@ impl Tool for GetTime {
         }
     }
 
-    async fn call(&self, _args: NoArgs) -> Result<Value> {
+    async fn call(&self, _ctx: &ToolContext, _args: NoArgs) -> Result<Value> {
         Ok(json!({ "time": chrono::Utc::now().to_rfc3339() }))
     }
 }
@@ -68,7 +68,7 @@ impl Tool for SaveMemo {
         }
     }
 
-    async fn call(&self, args: SaveMemoArgs) -> Result<Value> {
+    async fn call(&self, _ctx: &ToolContext, args: SaveMemoArgs) -> Result<Value> {
         Ok(json!({ "saved": true, "text": args.text }))
     }
 }

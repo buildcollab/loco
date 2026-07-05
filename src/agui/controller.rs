@@ -32,16 +32,17 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Extension, Path, Query, State};
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+use axum::extract::{Extension, Multipart, Path, Query, State};
+use sea_orm::{ActiveModelTrait, ColumnTrait, Condition, EntityTrait, QueryFilter, Set};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::agent::{AgentRegistry, Principal};
-use super::entities::{context_items, conversations, messages};
+use super::entities::{artifacts, context_items, conversations, messages};
 use super::hub::run_hub;
 use super::protocol::RunAgentInput;
+use super::scope::{NoScope, ScopeResolver};
 use super::transport::hub_sse_response;
 use super::worker::{dispatch_run, RunArgs};
 use crate::app::AppContext;
@@ -83,13 +84,65 @@ pub struct StreamQuery {
 // Helpers
 // ---------------------------------------------------------------------------
 
-async fn find_conversation(ctx: &AppContext, pid: &str) -> Result<conversations::Model> {
+/// Resolve a conversation by `pid`, applying the request's tenancy `filter` (if
+/// any) so a caller cannot reach a conversation outside its scope — the single
+/// choke point every conversation-resolving handler goes through.
+async fn find_conversation(
+    ctx: &AppContext,
+    pid: &str,
+    filter: Option<&Condition>,
+) -> Result<conversations::Model> {
     let uuid = Uuid::parse_str(pid).map_err(|e| Error::Message(e.to_string()))?;
-    conversations::Entity::find()
-        .filter(conversations::Column::Pid.eq(uuid))
-        .one(&ctx.db)
-        .await?
-        .ok_or(Error::NotFound)
+    let mut query =
+        conversations::Entity::find().filter(conversations::Column::Pid.eq(uuid));
+    if let Some(cond) = filter {
+        query = query.filter(cond.clone());
+    }
+    query.one(&ctx.db).await?.ok_or(Error::NotFound)
+}
+
+/// The request's resolved tenancy scope: the JSON `value` to stamp on a new
+/// conversation, and the DB `filter` restricting which conversations the request
+/// may read. Produced by the mounted [`ScopeResolver`] (default [`NoScope`] →
+/// both `None`, i.e. unscoped).
+struct ReqScope {
+    value: Option<Value>,
+    filter: Option<Condition>,
+}
+
+impl<S> axum::extract::FromRequestParts<S> for ReqScope
+where
+    AppContext: axum::extract::FromRef<S>,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        use axum::extract::FromRef;
+        let ctx = AppContext::from_ref(state);
+        // Principal extraction is infallible (missing/invalid token → anonymous).
+        let principal =
+            <PrincipalExtract as axum::extract::FromRequestParts<S>>::from_request_parts(
+                parts, state,
+            )
+            .await
+            .unwrap_or(PrincipalExtract(Principal::default()))
+            .0;
+        let resolver = parts
+            .extensions
+            .get::<Arc<dyn ScopeResolver>>()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(NoScope) as Arc<dyn ScopeResolver>);
+        let value = resolver
+            .resolve(&ctx, parts, &principal)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        let filter = value.as_ref().map(|s| resolver.filter(s));
+        Ok(Self { value, filter })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -120,11 +173,14 @@ async fn get_agent(
 async fn list_conversations(
     Path(agent_id): Path<String>,
     State(ctx): State<AppContext>,
+    scope: ReqScope,
 ) -> Result<Response> {
-    let rows = conversations::Entity::find()
-        .filter(conversations::Column::AgentId.eq(&agent_id))
-        .all(&ctx.db)
-        .await?;
+    let mut query =
+        conversations::Entity::find().filter(conversations::Column::AgentId.eq(&agent_id));
+    if let Some(cond) = &scope.filter {
+        query = query.filter(cond.clone());
+    }
+    let rows = query.all(&ctx.db).await?;
     format::json(rows)
 }
 
@@ -132,6 +188,7 @@ async fn create_conversation(
     Path(agent_id): Path<String>,
     State(ctx): State<AppContext>,
     Extension(registry): Registry,
+    scope: ReqScope,
     Json(params): Json<CreateConversationParams>,
 ) -> Result<Response> {
     if registry.get(&agent_id).is_none() {
@@ -143,6 +200,8 @@ async fn create_conversation(
         title: Set(params.title),
         mode: Set(params.mode),
         status: Set(Some("idle".to_string())),
+        // Stamp the request's tenancy scope so every later run/read is scoped.
+        scope: Set(scope.value),
         ..Default::default()
     };
     format::json(item.insert(&ctx.db).await?)
@@ -151,8 +210,9 @@ async fn create_conversation(
 async fn list_messages(
     Path(conversation_pid): Path<String>,
     State(ctx): State<AppContext>,
+    scope: ReqScope,
 ) -> Result<Response> {
-    let conversation = find_conversation(&ctx, &conversation_pid).await?;
+    let conversation = find_conversation(&ctx, &conversation_pid, scope.filter.as_ref()).await?;
     let mut rows = messages::Entity::find()
         .filter(messages::Column::ConversationId.eq(conversation.id))
         .all(&ctx.db)
@@ -164,9 +224,10 @@ async fn list_messages(
 async fn add_context(
     Path(conversation_pid): Path<String>,
     State(ctx): State<AppContext>,
+    scope: ReqScope,
     Json(params): Json<ContextParams>,
 ) -> Result<Response> {
-    let conversation = find_conversation(&ctx, &conversation_pid).await?;
+    let conversation = find_conversation(&ctx, &conversation_pid, scope.filter.as_ref()).await?;
     let item = context_items::ActiveModel {
         pid: Set(Uuid::new_v4()),
         conversation_id: Set(conversation.id),
@@ -178,6 +239,90 @@ async fn add_context(
         ..Default::default()
     };
     format::json(item.insert(&ctx.db).await?)
+}
+
+/// Upload a file as a conversation context item. The bytes are written to shared
+/// [`Storage`](crate::storage) (so any executing node can fetch them) and a
+/// `kind="file"` context item is created whose `reference` is the storage key.
+async fn upload_context(
+    Path(conversation_pid): Path<String>,
+    State(ctx): State<AppContext>,
+    scope: ReqScope,
+    mut multipart: Multipart,
+) -> Result<Response> {
+    let conversation = find_conversation(&ctx, &conversation_pid, scope.filter.as_ref()).await?;
+    let mut created: Vec<Value> = Vec::new();
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| Error::Message(e.to_string()))?
+    {
+        let name = field
+            .file_name()
+            .or_else(|| field.name())
+            .unwrap_or("upload")
+            .to_string();
+        let content_type = field.content_type().map(String::from);
+        let bytes = field
+            .bytes()
+            .await
+            .map_err(|e| Error::Message(e.to_string()))?;
+        let size = bytes.len();
+        // Namespaced, collision-free storage key under the conversation.
+        let key = format!(
+            "agui/{}/context/{}-{}",
+            conversation.pid,
+            Uuid::new_v4(),
+            name
+        );
+        ctx.storage
+            .upload(std::path::Path::new(&key), &bytes)
+            .await?;
+        let item = context_items::ActiveModel {
+            pid: Set(Uuid::new_v4()),
+            conversation_id: Set(conversation.id),
+            kind: Set("file".to_string()),
+            name: Set(name),
+            reference: Set(Some(key)),
+            metadata: Set(Some(json!({ "mime": content_type, "size": size }))),
+            ..Default::default()
+        };
+        created.push(serde_json::to_value(item.insert(&ctx.db).await?)?);
+    }
+    format::json(json!({ "uploaded": created }))
+}
+
+/// List a conversation's artifacts (for display). Scoped through the same
+/// tenancy filter as every other conversation read.
+async fn list_artifacts(
+    Path(conversation_pid): Path<String>,
+    State(ctx): State<AppContext>,
+    scope: ReqScope,
+) -> Result<Response> {
+    let conversation = find_conversation(&ctx, &conversation_pid, scope.filter.as_ref()).await?;
+    let mut rows = artifacts::Entity::find()
+        .filter(artifacts::Column::ConversationId.eq(conversation.id))
+        .all(&ctx.db)
+        .await?;
+    rows.sort_by_key(|a| a.id);
+    format::json(rows)
+}
+
+/// Fetch a single artifact of a conversation by its `pid`.
+async fn get_artifact(
+    Path((conversation_pid, artifact_pid)): Path<(String, String)>,
+    State(ctx): State<AppContext>,
+    scope: ReqScope,
+) -> Result<Response> {
+    let conversation = find_conversation(&ctx, &conversation_pid, scope.filter.as_ref()).await?;
+    let uuid = Uuid::parse_str(&artifact_pid).map_err(|e| Error::Message(e.to_string()))?;
+    let row = artifacts::Entity::find()
+        .filter(artifacts::Column::Pid.eq(uuid))
+        .filter(artifacts::Column::ConversationId.eq(conversation.id))
+        .one(&ctx.db)
+        .await?
+        .ok_or(Error::NotFound)?;
+    format::json(row)
 }
 
 /// Start (or resume-approve) a run. The run is decoupled from this connection:
@@ -192,9 +337,10 @@ async fn run(
     State(ctx): State<AppContext>,
     Extension(registry): Registry,
     principal: PrincipalExtract,
+    scope: ReqScope,
     Json(input): Json<RunAgentInput>,
 ) -> Result<Response> {
-    let conversation = find_conversation(&ctx, &conversation_pid).await?;
+    let conversation = find_conversation(&ctx, &conversation_pid, scope.filter.as_ref()).await?;
     // Validate the agent id against the registry before starting anything.
     if registry.get(&conversation.agent_id).is_none() {
         return Err(Error::NotFound);
@@ -221,9 +367,10 @@ async fn run(
 async fn stream(
     Path(conversation_pid): Path<String>,
     State(ctx): State<AppContext>,
+    scope: ReqScope,
     Query(q): Query<StreamQuery>,
 ) -> Result<Response> {
-    let conversation = find_conversation(&ctx, &conversation_pid).await?;
+    let conversation = find_conversation(&ctx, &conversation_pid, scope.filter.as_ref()).await?;
     let Some(run_id) = conversation.active_run_id.clone() else {
         return Ok((axum::http::StatusCode::NO_CONTENT, ()).into_response());
     };
@@ -236,8 +383,9 @@ async fn stream(
 async fn cancel(
     Path(conversation_pid): Path<String>,
     State(ctx): State<AppContext>,
+    scope: ReqScope,
 ) -> Result<Response> {
-    let conversation = find_conversation(&ctx, &conversation_pid).await?;
+    let conversation = find_conversation(&ctx, &conversation_pid, scope.filter.as_ref()).await?;
     if let Some(run_id) = &conversation.active_run_id {
         run_hub(&ctx).cancel(run_id).await?;
     }
@@ -245,10 +393,23 @@ async fn cancel(
 }
 
 /// Build the agent routes, capturing the app's agent `registry` in an extension
-/// layer so the handlers can resolve an agent by id. Mount with
+/// layer so the handlers can resolve an agent by id. Conversations are unscoped
+/// ([`NoScope`]). Mount with
 /// `AppRoutes::add_route(loco_rs::agui::controller::routes(registry))`.
 #[must_use]
 pub fn routes(registry: Arc<AgentRegistry>) -> Routes {
+    routes_with_scope(registry, Arc::new(NoScope))
+}
+
+/// Like [`routes`], but tenants conversations with an app-supplied
+/// [`ScopeResolver`] (org/project/...): it stamps the scope on create and filters
+/// every conversation read, so a request cannot reach a conversation outside its
+/// scope.
+#[must_use]
+pub fn routes_with_scope(
+    registry: Arc<AgentRegistry>,
+    scope: Arc<dyn ScopeResolver>,
+) -> Routes {
     Routes::new()
         .prefix("api/")
         .add("agents", get(list_agents))
@@ -263,10 +424,23 @@ pub fn routes(registry: Arc<AgentRegistry>) -> Routes {
             "conversations/{conversation_pid}/context",
             post(add_context),
         )
+        .add(
+            "conversations/{conversation_pid}/context/upload",
+            post(upload_context),
+        )
+        .add(
+            "conversations/{conversation_pid}/artifacts",
+            get(list_artifacts),
+        )
+        .add(
+            "conversations/{conversation_pid}/artifacts/{artifact_pid}",
+            get(get_artifact),
+        )
         .add("conversations/{conversation_pid}/run", post(run))
         .add("conversations/{conversation_pid}/stream", get(stream))
         .add("conversations/{conversation_pid}/cancel", post(cancel))
         .layer(Extension(registry))
+        .layer(Extension(scope))
 }
 
 // ---------------------------------------------------------------------------

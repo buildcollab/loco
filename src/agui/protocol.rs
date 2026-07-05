@@ -79,6 +79,29 @@ pub enum AguiEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         code: Option<String>,
     },
+
+    /// A generic, application-defined event. `name` identifies the kind (e.g.
+    /// `"artifact"`) and `value` carries its payload. This keeps the protocol
+    /// free of specific app concepts while letting the framework and apps stream
+    /// structured side-channel updates through the same (persisted, replayable)
+    /// event log. Mirrors AG-UI's custom-event convention.
+    #[serde(rename = "CUSTOM", rename_all = "camelCase")]
+    Custom { name: String, value: Value },
+
+    /// The full shared-state object for the run (AG-UI `STATE_SNAPSHOT`). Emitted
+    /// at run start so a (re)connecting client can render the current state.
+    #[serde(rename = "STATE_SNAPSHOT", rename_all = "camelCase")]
+    StateSnapshot { snapshot: Value },
+
+    /// An incremental shared-state update (AG-UI `STATE_DELTA`). `delta` is a
+    /// shallow merge-patch object applied over the current state.
+    #[serde(rename = "STATE_DELTA", rename_all = "camelCase")]
+    StateDelta { delta: Value },
+
+    /// A chunk of the model's reasoning ("thinking"), streamed distinctly from
+    /// the assistant answer so the UI can show the agent's plan/work.
+    #[serde(rename = "THINKING_CONTENT", rename_all = "camelCase")]
+    ThinkingContent { message_id: String, delta: String },
 }
 
 /// Terminal outcome of a run.
@@ -129,10 +152,14 @@ pub struct ResumeItem {
     pub payload: ResumePayload,
 }
 
-/// Payload for a [`ResumeItem`] — currently a simple approve/deny gate.
+/// Payload for a [`ResumeItem`]: an approve/deny gate, plus optional `input` for
+/// an `ask_user` interrupt (the user's answer to a clarifying question).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResumePayload {
     pub approved: bool,
+    /// The user's answer when resuming an `ask_user` interrupt.
+    #[serde(default)]
+    pub input: Option<Value>,
 }
 
 impl AguiEvent {
@@ -150,6 +177,10 @@ impl AguiEvent {
             Self::ToolCallResult { .. } => "TOOL_CALL_RESULT",
             Self::RunFinished { .. } => "RUN_FINISHED",
             Self::RunError { .. } => "RUN_ERROR",
+            Self::Custom { .. } => "CUSTOM",
+            Self::StateSnapshot { .. } => "STATE_SNAPSHOT",
+            Self::StateDelta { .. } => "STATE_DELTA",
+            Self::ThinkingContent { .. } => "THINKING_CONTENT",
         }
     }
 }
@@ -179,6 +210,30 @@ pub fn part_tool_result(tool_call_id: &str, status: &str, content: &Value) -> Va
         "toolCallId": tool_call_id,
         "status": status,
         "content": content,
+    })
+}
+
+/// A "thinking" message part (the model's persisted reasoning).
+#[must_use]
+pub fn part_thinking(text: &str) -> Value {
+    json!({ "type": "thinking", "text": text })
+}
+
+/// An "image" message part (a URL or data URL) — for multimodal/vision turns.
+#[must_use]
+pub fn part_image(url: &str) -> Value {
+    json!({ "type": "image", "url": url })
+}
+
+/// A "citation" message part linking an answer to a source (a memory/artifact id
+/// or URL) — provenance the UI can render inline.
+#[must_use]
+pub fn part_citation(text: &str, source: &str, url: Option<&str>) -> Value {
+    json!({
+        "type": "citation",
+        "text": text,
+        "source": source,
+        "url": url,
     })
 }
 

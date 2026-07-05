@@ -28,6 +28,8 @@ pub const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 pub enum AgentDelta {
     /// A chunk of assistant text.
     TextDelta(String),
+    /// A chunk of the model's out-of-band reasoning ("thinking") text.
+    ReasoningDelta(String),
     /// A tool call has started at stream position `index`.
     ToolCallStart {
         index: usize,
@@ -321,10 +323,41 @@ fn messages_to_json(system: &str, history: &[ChatMessage], cache_system: bool) -
                 "tool_calls": calls,
             }));
         } else {
-            out.push(json!({ "role": m.role, "content": m.content }));
+            // Multimodal pass-through: if the content is a JSON array (built by
+            // [`multimodal_content`]), forward it as structured content (text +
+            // image_url parts) for vision models; otherwise send plain text.
+            out.push(json!({ "role": m.role, "content": content_value(&m.content) }));
         }
     }
     out
+}
+
+/// Interpret a message's stored `content`: a JSON array (a multimodal payload)
+/// is forwarded as structured content; anything else is plain text.
+fn content_value(content: &str) -> Value {
+    if content.trim_start().starts_with('[') {
+        if let Ok(v @ Value::Array(_)) = serde_json::from_str::<Value>(content) {
+            return v;
+        }
+    }
+    Value::String(content.to_string())
+}
+
+/// Build an OpenAI-compatible multimodal user-message content payload (text plus
+/// one or more image URLs / data URLs), serialized as a JSON string. Store it as
+/// a user message's content and vision-capable models will see the images.
+///
+/// ```ignore
+/// let content = multimodal_content("What's in this chart?", &[data_url]);
+/// store.append_user_message(&content).await?; // vision turn
+/// ```
+#[must_use]
+pub fn multimodal_content(text: &str, image_urls: &[String]) -> String {
+    let mut parts = vec![json!({ "type": "text", "text": text })];
+    for url in image_urls {
+        parts.push(json!({ "type": "image_url", "image_url": { "url": url } }));
+    }
+    Value::Array(parts).to_string()
 }
 
 /// Incrementally assembles OpenAI-style streaming chunks into deltas + a final
@@ -377,6 +410,10 @@ impl StreamAssembler {
             let reasoning = extract_reasoning(&delta);
             if !reasoning.is_empty() {
                 self.reasoning.push_str(reasoning);
+                // Forward as a live "thinking" delta (distinct from TextDelta) so
+                // the UI can render the model's reasoning without it polluting the
+                // assistant answer.
+                deltas.push(AgentDelta::ReasoningDelta(reasoning.to_string()));
             }
 
             if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
@@ -586,6 +623,9 @@ pub struct RigConfig {
     pub top_p: Option<f64>,
     /// Mark the system prompt as a cache breakpoint (Anthropic via OpenRouter).
     pub cache_system: bool,
+    /// OpenAI-compatible `response_format` (structured output). When set, sent on
+    /// every request so the model's answer conforms to the schema.
+    pub response_format: Option<Value>,
     /// Max retry attempts for transient failures (429 / 5xx / connect).
     pub max_retries: usize,
     /// Idle timeout between streamed chunks before aborting a stalled stream.
@@ -605,6 +645,7 @@ impl Default for RigConfig {
             max_tokens: None,
             top_p: None,
             cache_system: false,
+            response_format: None,
             max_retries: 2,
             idle_timeout: Duration::from_secs(60),
             request_timeout: Duration::from_secs(120),
@@ -699,6 +740,18 @@ impl RigProvider {
         self
     }
 
+    /// Constrain the model's answer to a JSON schema (OpenAI-compatible
+    /// structured output). `schema` is a JSON Schema object; it is wrapped in the
+    /// `json_schema` response-format envelope. Builder style.
+    #[must_use]
+    pub fn with_response_format(mut self, schema: Value) -> Self {
+        self.config.response_format = Some(json!({
+            "type": "json_schema",
+            "json_schema": { "name": "response", "schema": schema, "strict": true }
+        }));
+        self
+    }
+
     fn endpoint(&self) -> String {
         format!("{}/chat/completions", self.base_url.trim_end_matches('/'))
     }
@@ -720,6 +773,9 @@ impl RigProvider {
         }
         if let Some(p) = self.config.top_p {
             body["top_p"] = json!(p);
+        }
+        if let Some(rf) = &self.config.response_format {
+            body["response_format"] = rf.clone();
         }
         body
     }
@@ -1596,6 +1652,33 @@ mod tests {
             b1["messages"][0]["content"][0]["cache_control"]["type"],
             "ephemeral"
         );
+    }
+
+    #[test]
+    fn multimodal_content_forwards_as_structured() {
+        let content = multimodal_content("what is this?", &["data:image/png;base64,AAAA".into()]);
+        let hist = vec![ChatMessage::text("user", &content)];
+        let msgs = messages_to_json("", &hist, false);
+        // The user message content became a structured array (text + image_url).
+        assert!(msgs[0]["content"].is_array());
+        assert_eq!(msgs[0]["content"][0]["type"], "text");
+        assert_eq!(msgs[0]["content"][1]["type"], "image_url");
+        // Plain text still passes through as a string.
+        let plain = messages_to_json("", &[ChatMessage::text("user", "hello")], false);
+        assert_eq!(plain[0]["content"], json!("hello"));
+    }
+
+    #[test]
+    fn response_format_wraps_schema_when_set() {
+        let base = RigProvider::new("k", None, "m");
+        assert!(base.build_body("s", &[], &[]).get("response_format").is_none());
+
+        let schema = json!({ "type": "object", "properties": { "title": { "type": "string" } } });
+        let structured = RigProvider::new("k", None, "m").with_response_format(schema.clone());
+        let body = structured.build_body("s", &[], &[]);
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(body["response_format"]["json_schema"]["strict"], json!(true));
+        assert_eq!(body["response_format"]["json_schema"]["schema"], schema);
     }
 
     #[test]

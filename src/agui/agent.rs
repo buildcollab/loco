@@ -19,6 +19,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value;
 
+use crate::agui::context::{Embedder, NoEmbedder, NoTokens, TokenResolver};
+use crate::agui::guardrail::{BudgetLimiter, Guardrail, NoGuardrail, Unlimited};
 use crate::agui::provider::{ToolCallReq, TurnOutcome};
 use crate::agui::runtime::{AllowAll, ToolAuthorizer};
 use crate::agui::tool::Tools;
@@ -54,10 +56,21 @@ pub struct AgentCtx<'a> {
     pub app: &'a AppContext,
     /// Public id of the conversation (AG-UI `thread_id`).
     pub thread_id: String,
+    /// Numeric id of the conversation (for store/artifact scoping).
+    pub conversation_id: i32,
     /// Selected conversation mode, if any.
     pub mode: Option<String>,
     /// The authenticated caller.
     pub principal: Principal,
+    /// The persisted tenancy value (org/project/...), read from the conversation
+    /// row. `None` when the conversation is unscoped. Threaded into the
+    /// [`ToolContext`](crate::agui::context::ToolContext) for scoping/billing.
+    pub scope: Option<serde_json::Value>,
+    /// App-defined custom dependencies, built by [`Agent::extensions`] on the
+    /// executing node and forwarded onto the
+    /// [`ToolContext`](crate::agui::context::ToolContext). Downcast with
+    /// [`ToolContext::ext`](crate::agui::context::ToolContext::ext).
+    pub extensions: Arc<dyn std::any::Any + Send + Sync>,
 }
 
 /// Lightweight, app-agnostic context passed to [`AgentHooks`] from inside the
@@ -113,6 +126,16 @@ pub trait AgentHooks: Send + Sync {
     async fn on_error(&self, _ctx: &RunCtx, _err: &Error) {}
 }
 
+/// A ready-made ReAct-style planning instruction for [`Agent::planner`]: reason
+/// about the goal and the data to gather before acting, using tools to fill gaps.
+#[must_use]
+pub fn react_planner() -> String {
+    "Before answering, briefly plan: restate the goal, list what information you \
+     need and which tools/sources can provide it, then gather it step by step \
+     (calling tools as needed) before writing your final answer."
+        .to_string()
+}
+
 /// A no-op [`AgentHooks`] — the default when an agent declares none.
 pub struct NoopHooks;
 
@@ -141,6 +164,21 @@ pub trait Agent: Send + Sync {
     /// Propagates any error while gathering prompt material (e.g. DB reads).
     async fn system_prompt(&self, ctx: &AgentCtx<'_>) -> Result<String>;
 
+    /// An optional JSON Schema constraining the model's final answer (structured
+    /// output). When set, the run sends it as the provider `response_format`, so
+    /// the agent returns a validated JSON object — ideal for report generation.
+    fn response_schema(&self, _ctx: &AgentCtx<'_>) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// An optional planning instruction appended to the system prompt — e.g. a
+    /// ReAct "think step by step, then act" directive that makes multi-step data
+    /// collation more reliable. Returns `None` (no planner) by default;
+    /// [`react_planner`] is a ready-made instruction.
+    fn planner(&self, _ctx: &AgentCtx<'_>) -> Option<String> {
+        None
+    }
+
     /// The typed tools this agent exposes.
     fn tools(&self) -> Tools;
 
@@ -153,6 +191,47 @@ pub trait Agent: Send + Sync {
     /// write/approval gate still applies).
     fn authorizer(&self, _ctx: &AgentCtx<'_>) -> Arc<dyn ToolAuthorizer> {
         Arc::new(AllowAll)
+    }
+
+    /// The token resolver this agent's tools use to obtain access tokens for
+    /// external services (defaults to [`NoTokens`]). Built on the executing node
+    /// from `ctx` so long-running / worker runs mint fresh tokens rather than
+    /// replaying a captured (expired) one.
+    fn token_resolver(&self, _ctx: &AgentCtx<'_>) -> Arc<dyn TokenResolver> {
+        Arc::new(NoTokens)
+    }
+
+    /// The embedder backing this agent's long-term memory search (defaults to
+    /// [`NoEmbedder`], i.e. lexical ranking). Return an embedder that calls your
+    /// embedding model to enable semantic (cosine) retrieval.
+    fn embedder(&self, _ctx: &AgentCtx<'_>) -> Arc<dyn Embedder> {
+        Arc::new(NoEmbedder)
+    }
+
+    /// The guardrail applied around each turn — inspect/rewrite the model input
+    /// and output, or block the run (defaults to a no-op [`NoGuardrail`]).
+    fn guardrail(&self, _ctx: &AgentCtx<'_>) -> Arc<dyn Guardrail> {
+        Arc::new(NoGuardrail)
+    }
+
+    /// The per-turn budget limiter (defaults to [`Unlimited`]). Cap spend per
+    /// tenant/run using the run's scope + accumulated usage.
+    fn budget(&self, _ctx: &AgentCtx<'_>) -> Arc<dyn BudgetLimiter> {
+        Arc::new(Unlimited)
+    }
+
+    /// App-defined custom dependencies to place on the run's
+    /// [`ToolContext`](crate::agui::context::ToolContext). Return your own deps
+    /// struct as `Arc<dyn Any + Send + Sync>`; tools recover it with
+    /// [`ToolContext::ext`](crate::agui::context::ToolContext::ext). Defaults to
+    /// an empty unit. Built on the executing node, so it is multi-node safe (no
+    /// value crosses a serialized job payload).
+    fn extensions(
+        &self,
+        _app: &AppContext,
+        _principal: &Principal,
+    ) -> Arc<dyn std::any::Any + Send + Sync> {
+        Arc::new(())
     }
 }
 
