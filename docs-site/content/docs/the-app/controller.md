@@ -39,8 +39,10 @@ To view a list of all your registered controllers, execute the following command
 $ cargo loco routes
 
 [GET] /_health
+[GET] /_metrics
 [GET] /_ping
 [GET] /_readiness
+[GET] /_server
 [POST] /auth/forgot
 [POST] /auth/login
 [POST] /auth/register
@@ -322,6 +324,112 @@ Why we separate these endpoints?
 - **Load Balancer Clarity**: A Clear distinction helps load balancers make accurate routing decisions without conflating server and dependency health.
 - **Flexibility**: Splitting endpoints gives users more control to decide which checks to monitor based on their needs (e.g., prioritizing liveness for basic uptime or readiness for full system health).
 - **Debugging**: Separate endpoints make it easier to diagnose issues (e.g., server up but S3 down).
+
+### Server info endpoint
+
+A `_server` endpoint is also registered automatically. It returns a JSON manifest describing the running server, useful for understanding what a deployed instance actually is:
+
+```sh
+$ curl http://localhost:5150/_server
+{
+  "name": "myapp",
+  "version": "0.1.0 (a1b2c3d)",
+  "environment": "development",
+  "build": {
+    "loco_version": "0.16.4",
+    "rustc_version": "rustc 1.84.0 (9fc6b4312 2025-01-07)",
+    "profile": "debug",
+    "target": "x86_64-unknown-linux-gnu"
+  },
+  "routes": [
+    { "methods": ["GET"], "uri": "/_health" },
+    { "methods": ["GET"], "uri": "/_server" }
+  ],
+  "custom": { }
+}
+```
+
+The manifest is assembled from three tiers of data:
+
+- **Build-time metadata** (`build`): captured by the build script and baked into the binary — the `loco-rs` version, the `rustc` version, the build profile, and the target triple.
+- **Boot-time metadata**: the application name, version (from `Hooks::app_version`), environment, and the full list of registered `routes`. These are collected once during boot.
+- **Custom fields** (`custom`): anything you want to expose. Override `Hooks::server_info_extras` to return a `serde_json::Value`:
+
+```rust
+fn server_info_extras(_ctx: &AppContext) -> serde_json::Value {
+    serde_json::json!({
+        "region": std::env::var("REGION").unwrap_or_default(),
+        "feature_flags": ["new_billing"],
+    })
+}
+```
+
+> Note: `_server` reports internal details (route list, versions) and is enabled by default like the other monitoring endpoints. If you don't want it publicly reachable, guard it with authentication middleware or restrict access at your load balancer / ingress.
+
+### Metrics endpoint
+
+A `_metrics` endpoint is registered automatically and returns metrics in the [Prometheus text exposition format](https://prometheus.io/docs/instrumenting/exposition_formats/), ready to be scraped by Prometheus / Grafana:
+
+```sh
+$ curl http://localhost:5150/_metrics
+# HELP loco_build_info Build information about the running Loco application.
+# TYPE loco_build_info gauge
+loco_build_info{version="0.1.0 (a1b2c3d)",loco_version="0.16.4",rustc_version="rustc 1.84.0",profile="debug",target="x86_64-unknown-linux-gnu",environment="development"} 1
+# HELP loco_routes_total Number of routes registered in the application.
+# TYPE loco_routes_total gauge
+loco_routes_total 12
+# HELP loco_uptime_seconds Seconds since the server booted.
+# TYPE loco_uptime_seconds gauge
+loco_uptime_seconds 42.5
+# HELP loco_start_time_seconds Unix timestamp of when the server booted.
+# TYPE loco_start_time_seconds gauge
+loco_start_time_seconds 1720000000.0
+```
+
+Loco intentionally does not depend on a metrics backend, so the core endpoint emits only a few always-available metrics (`loco_build_info`, `loco_routes_total`, `loco_uptime_seconds`, `loco_start_time_seconds`).
+
+#### Adding your own metrics
+
+Override `Hooks::metrics` to append your own metrics. The returned string is added to the core metrics and is evaluated on every scrape, so it can be fully dynamic:
+
+```rust
+fn metrics(_ctx: &AppContext) -> String {
+    // Typically rendered from your metrics registry.
+    "# TYPE myapp_active_users gauge\nmyapp_active_users 42\n".to_string()
+}
+```
+
+#### Built-in metric helpers
+
+Loco ships two dependency-free helper libraries in `loco_rs::metrics` that plug straight into this hook — no extra crates, no build flags:
+
+- [`loco_rs::metrics::http`](https://docs.rs/loco-rs/latest/loco_rs/metrics/http/index.html) — HTTP request metrics: request counts, a latency histogram, and an in-flight gauge, labeled by method, matched route path, and status. It's a small Axum middleware plus a renderer.
+- [`loco_rs::metrics::runtime`](https://docs.rs/loco-rs/latest/loco_rs/metrics/runtime/index.html) — Tokio runtime metrics (`loco_runtime_workers`, `loco_runtime_alive_tasks`, `loco_runtime_global_queue_depth`) from the stable subset of `RuntimeMetrics`.
+
+Install the HTTP collector + middleware in `after_routes`, then render both from `metrics`:
+
+```rust
+async fn after_routes(router: AxumRouter, ctx: &AppContext) -> Result<AxumRouter> {
+    let http = loco_rs::metrics::http::HttpMetrics::install(ctx);
+    Ok(router.layer(axum::middleware::from_fn_with_state(
+        http,
+        loco_rs::metrics::http::track,
+    )))
+}
+
+fn metrics(ctx: &AppContext) -> String {
+    let mut out = loco_rs::metrics::http::render(ctx);
+    out.push_str(&loco_rs::metrics::runtime::render());
+    out
+}
+```
+
+For metrics beyond these, render any Prometheus-formatted string into the same hook:
+
+- **HTTP metrics via the `metrics` ecosystem**: [`axum-prometheus`](https://crates.io/crates/axum-prometheus) (built on the [`metrics`](https://crates.io/crates/metrics) facade + [`metrics-exporter-prometheus`](https://crates.io/crates/metrics-exporter-prometheus)) — add its `Layer`, stash the `PrometheusHandle`, and return `handle.render()`.
+- **Full Tokio runtime & per-task metrics**: [`tokio-metrics`](https://crates.io/crates/tokio-metrics) (`RuntimeMonitor` / `TaskMonitor`). The detailed counters require building the app with `RUSTFLAGS="--cfg tokio_unstable"` (a build flag, not a cargo feature), so Loco cannot enable them for you — add it to your app's `.cargo/config.toml`.
+
+> Note: like `_server`, `_metrics` exposes internal details and is enabled by default. Guard it with middleware or your ingress if it should not be public.
 
 # Middleware
 
