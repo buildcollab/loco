@@ -5,7 +5,7 @@
 use super::{format, routes::Routes};
 #[cfg(any(feature = "cache_inmem", feature = "cache_redis"))]
 use crate::config;
-use crate::{app::AppContext, Result};
+use crate::{app::AppContext, server_info::ServerInfo, Result};
 use axum::{
     extract::State,
     http::StatusCode,
@@ -97,12 +97,31 @@ pub async fn readiness(State(ctx): State<AppContext>) -> (StatusCode, Response) 
     )
 }
 
+/// Report information about the running server.
+///
+/// Returns the [`ServerInfo`] manifest assembled during boot (application name
+/// and version, environment, build metadata, registered routes, and any
+/// application-provided custom fields). When the manifest has not been populated
+/// (for example, when the endpoint is exercised outside the normal boot flow),
+/// a minimal manifest is returned instead.
+///
+/// # Errors
+/// Returns an error only if the manifest fails to serialize to JSON.
+pub async fn server_info(State(ctx): State<AppContext>) -> Result<Response> {
+    let info = ctx
+        .shared_store
+        .get::<ServerInfo>()
+        .unwrap_or_else(ServerInfo::minimal);
+    format::json(info)
+}
+
 /// Defines and returns the readiness-related routes.
 pub fn routes() -> Routes {
     Routes::new()
         .add("/_readiness", get(readiness))
         .add("/_ping", get(ping))
         .add("/_health", get(health))
+        .add("/_server", get(server_info))
 }
 
 #[cfg(test)]
@@ -170,6 +189,83 @@ mod tests {
             .unwrap();
         let res_json: Value = serde_json::from_slice(&body).expect("Valid JSON response");
         assert_eq!(res_json["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn server_info_works() {
+        use loco_rs::server_info::ServerInfo;
+
+        let ctx = tests_cfg::app::get_app_context().await;
+
+        // Populate the manifest as boot would, so the endpoint returns it.
+        let routes = loco_rs::controller::AppRoutes::with_default_routes();
+        ctx.shared_store.insert(ServerInfo {
+            name: "test_app".to_string(),
+            version: "1.2.3".to_string(),
+            environment: ctx.environment.to_string(),
+            build: loco_rs::server_info::BuildInfo::current(),
+            routes: ServerInfo::routes_from(&routes),
+            custom: serde_json::json!({ "region": "eu-west-1" }),
+        });
+
+        let router = axum::Router::new()
+            .route("/_server", get(monitoring::server_info))
+            .with_state(ctx);
+
+        let req = axum::http::Request::builder()
+            .uri("/_server")
+            .method("GET")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), 200);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let res_json: Value = serde_json::from_slice(&body).expect("Valid JSON response");
+        assert_eq!(res_json["name"], "test_app");
+        assert_eq!(res_json["version"], "1.2.3");
+        assert_eq!(res_json["custom"]["region"], "eu-west-1");
+        assert!(!res_json["build"]["loco_version"]
+            .as_str()
+            .unwrap()
+            .is_empty());
+        // The default monitoring routes should be present in the manifest.
+        let uris: Vec<&str> = res_json["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["uri"].as_str().unwrap())
+            .collect();
+        assert!(uris.contains(&"/_health"));
+        assert!(uris.contains(&"/_server"));
+    }
+
+    #[tokio::test]
+    async fn server_info_falls_back_to_minimal() {
+        let ctx = tests_cfg::app::get_app_context().await;
+
+        let router = axum::Router::new()
+            .route("/_server", get(monitoring::server_info))
+            .with_state(ctx);
+
+        let req = axum::http::Request::builder()
+            .uri("/_server")
+            .method("GET")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), 200);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let res_json: Value = serde_json::from_slice(&body).expect("Valid JSON response");
+        assert_eq!(res_json["name"], "unknown");
+        assert_eq!(res_json["routes"].as_array().unwrap().len(), 0);
     }
 
     #[cfg(not(feature = "with-db"))]

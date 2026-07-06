@@ -501,7 +501,18 @@ async fn setup_routes<H: Hooks>(
     initializers: &[Box<dyn Initializer>],
 ) -> Result<Router> {
     let app = H::before_routes(app_context).await?;
-    let app = H::routes(app_context).to_router::<H>(app_context.clone(), app)?;
+    let app_routes = H::routes(app_context);
+
+    // Capture the server-info manifest while the routes are known, before they
+    // are consumed by the router. Served at `/_server`.
+    app_context
+        .shared_store
+        .insert(crate::server_info::ServerInfo::from_hooks::<H>(
+            app_context,
+            &app_routes,
+        ));
+
+    let app = app_routes.to_router::<H>(app_context.clone(), app)?;
     let mut router = H::after_routes(app, app_context).await?;
 
     for initializer in initializers {

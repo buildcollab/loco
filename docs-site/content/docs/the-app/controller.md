@@ -41,6 +41,7 @@ $ cargo loco routes
 [GET] /_health
 [GET] /_ping
 [GET] /_readiness
+[GET] /_server
 [POST] /auth/forgot
 [POST] /auth/login
 [POST] /auth/register
@@ -322,6 +323,47 @@ Why we separate these endpoints?
 - **Load Balancer Clarity**: A Clear distinction helps load balancers make accurate routing decisions without conflating server and dependency health.
 - **Flexibility**: Splitting endpoints gives users more control to decide which checks to monitor based on their needs (e.g., prioritizing liveness for basic uptime or readiness for full system health).
 - **Debugging**: Separate endpoints make it easier to diagnose issues (e.g., server up but S3 down).
+
+### Server info endpoint
+
+A `_server` endpoint is also registered automatically. It returns a JSON manifest describing the running server, useful for understanding what a deployed instance actually is:
+
+```sh
+$ curl http://localhost:5150/_server
+{
+  "name": "myapp",
+  "version": "0.1.0 (a1b2c3d)",
+  "environment": "development",
+  "build": {
+    "loco_version": "0.16.4",
+    "rustc_version": "rustc 1.84.0 (9fc6b4312 2025-01-07)",
+    "profile": "debug",
+    "target": "x86_64-unknown-linux-gnu"
+  },
+  "routes": [
+    { "methods": ["GET"], "uri": "/_health" },
+    { "methods": ["GET"], "uri": "/_server" }
+  ],
+  "custom": { }
+}
+```
+
+The manifest is assembled from three tiers of data:
+
+- **Build-time metadata** (`build`): captured by the build script and baked into the binary — the `loco-rs` version, the `rustc` version, the build profile, and the target triple.
+- **Boot-time metadata**: the application name, version (from `Hooks::app_version`), environment, and the full list of registered `routes`. These are collected once during boot.
+- **Custom fields** (`custom`): anything you want to expose. Override `Hooks::server_info_extras` to return a `serde_json::Value`:
+
+```rust
+fn server_info_extras(_ctx: &AppContext) -> serde_json::Value {
+    serde_json::json!({
+        "region": std::env::var("REGION").unwrap_or_default(),
+        "feature_flags": ["new_billing"],
+    })
+}
+```
+
+> Note: `_server` reports internal details (route list, versions) and is enabled by default like the other monitoring endpoints. If you don't want it publicly reachable, guard it with authentication middleware or restrict access at your load balancer / ingress.
 
 # Middleware
 

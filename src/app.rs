@@ -299,6 +299,28 @@ pub trait Hooks: Send {
     /// ```
     fn app_name() -> &'static str;
 
+    /// Provide custom fields to include in the `/_server` manifest.
+    ///
+    /// Return any JSON value (typically an object) to merge application-specific
+    /// information into the server-info endpoint. This is the customization
+    /// mechanism for the `/_server` route: whatever is returned here is placed
+    /// under the `custom` key of the manifest. Defaults to `null` (omitted from
+    /// the output).
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// fn server_info_extras(_ctx: &AppContext) -> serde_json::Value {
+    ///     serde_json::json!({
+    ///         "region": std::env::var("REGION").unwrap_or_default(),
+    ///         "feature_flags": ["new_billing"],
+    ///     })
+    /// }
+    /// ```
+    #[must_use]
+    fn server_info_extras(_ctx: &AppContext) -> serde_json::Value {
+        serde_json::Value::Null
+    }
+
     /// Initializes and boots the application based on the specified mode and
     /// environment.
     ///
