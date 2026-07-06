@@ -512,6 +512,13 @@ async fn setup_routes<H: Hooks>(
             &app_routes,
         ));
 
+    // Wire up the `/_metrics` endpoint: record the boot time for uptime and
+    // register the application's metrics renderer.
+    app_context.shared_store.insert(crate::metrics::BootTime::now());
+    app_context
+        .shared_store
+        .insert(crate::metrics::MetricsHook(H::metrics));
+
     let app = app_routes.to_router::<H>(app_context.clone(), app)?;
     let mut router = H::after_routes(app, app_context).await?;
 

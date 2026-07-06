@@ -38,6 +38,7 @@ pub mod errors;
 pub mod hash;
 pub mod logger;
 pub mod mailer;
+pub mod metrics;
 pub mod scheduler;
 pub mod server_info;
 pub mod task;

@@ -8,7 +8,7 @@ use crate::config;
 use crate::{app::AppContext, server_info::ServerInfo, Result};
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -115,6 +115,26 @@ pub async fn server_info(State(ctx): State<AppContext>) -> Result<Response> {
     format::json(info)
 }
 
+/// Expose application metrics in the Prometheus text exposition format.
+///
+/// Renders the core runtime metrics Loco always emits (build info, route count,
+/// uptime, start time) followed by any application-provided metrics returned
+/// from [`Hooks::metrics`](crate::app::Hooks::metrics).
+///
+/// # Errors
+/// This function always returns `Ok` with a `text/plain` response.
+pub async fn metrics(State(ctx): State<AppContext>) -> Result<Response> {
+    let body = crate::metrics::render(&ctx);
+    Ok((
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response())
+}
+
 /// Defines and returns the readiness-related routes.
 pub fn routes() -> Routes {
     Routes::new()
@@ -122,6 +142,7 @@ pub fn routes() -> Routes {
         .add("/_ping", get(ping))
         .add("/_health", get(health))
         .add("/_server", get(server_info))
+        .add("/_metrics", get(metrics))
 }
 
 #[cfg(test)]
@@ -266,6 +287,63 @@ mod tests {
         let res_json: Value = serde_json::from_slice(&body).expect("Valid JSON response");
         assert_eq!(res_json["name"], "unknown");
         assert_eq!(res_json["routes"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn metrics_works() {
+        use loco_rs::metrics::{BootTime, MetricsHook};
+        use loco_rs::server_info::{BuildInfo, ServerInfo};
+
+        let ctx = tests_cfg::app::get_app_context().await;
+
+        let routes = loco_rs::controller::AppRoutes::with_default_routes();
+        ctx.shared_store.insert(ServerInfo {
+            name: "test_app".to_string(),
+            version: "1.2.3".to_string(),
+            environment: ctx.environment.to_string(),
+            build: BuildInfo::current(),
+            routes: ServerInfo::routes_from(&routes),
+            custom: serde_json::Value::Null,
+        });
+        ctx.shared_store.insert(BootTime::now());
+        ctx.shared_store.insert(MetricsHook(|_ctx| {
+            "# TYPE myapp_answer gauge\nmyapp_answer 42\n".to_string()
+        }));
+
+        let router = axum::Router::new()
+            .route("/_metrics", get(monitoring::metrics))
+            .with_state(ctx);
+
+        let req = axum::http::Request::builder()
+            .uri("/_metrics")
+            .method("GET")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "text/plain; version=0.0.4; charset=utf-8"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).expect("valid utf-8");
+
+        // Core metrics.
+        assert!(text.contains("loco_build_info{"));
+        assert!(text.contains("version=\"1.2.3\""));
+        assert!(text.contains("loco_routes_total "));
+        assert!(text.contains("loco_uptime_seconds "));
+        // Application-provided metrics are appended.
+        assert!(text.contains("myapp_answer 42"));
     }
 
     #[cfg(not(feature = "with-db"))]

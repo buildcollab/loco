@@ -321,6 +321,30 @@ pub trait Hooks: Send {
         serde_json::Value::Null
     }
 
+    /// Provide application metrics for the `/_metrics` endpoint.
+    ///
+    /// Return additional metrics in the [Prometheus text exposition format],
+    /// which are appended to the core runtime metrics Loco always emits. This is
+    /// the customization mechanism for the `/_metrics` route and is invoked on
+    /// every scrape, so the returned values can be fully dynamic. Loco itself
+    /// does not depend on a metrics backend; wire in your own registry (e.g. the
+    /// `metrics` or `prometheus` crates) and render it here. Defaults to an empty
+    /// string.
+    ///
+    /// [Prometheus text exposition format]: https://prometheus.io/docs/instrumenting/exposition_formats/
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// fn metrics(_ctx: &AppContext) -> String {
+    ///     // Typically rendered from your metrics registry.
+    ///     "# TYPE myapp_active_users gauge\nmyapp_active_users 42\n".to_string()
+    /// }
+    /// ```
+    #[must_use]
+    fn metrics(_ctx: &AppContext) -> String {
+        String::new()
+    }
+
     /// Initializes and boots the application based on the specified mode and
     /// environment.
     ///

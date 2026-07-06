@@ -39,6 +39,7 @@ To view a list of all your registered controllers, execute the following command
 $ cargo loco routes
 
 [GET] /_health
+[GET] /_metrics
 [GET] /_ping
 [GET] /_readiness
 [GET] /_server
@@ -364,6 +365,37 @@ fn server_info_extras(_ctx: &AppContext) -> serde_json::Value {
 ```
 
 > Note: `_server` reports internal details (route list, versions) and is enabled by default like the other monitoring endpoints. If you don't want it publicly reachable, guard it with authentication middleware or restrict access at your load balancer / ingress.
+
+### Metrics endpoint
+
+A `_metrics` endpoint is registered automatically and returns metrics in the [Prometheus text exposition format](https://prometheus.io/docs/instrumenting/exposition_formats/), ready to be scraped by Prometheus / Grafana:
+
+```sh
+$ curl http://localhost:5150/_metrics
+# HELP loco_build_info Build information about the running Loco application.
+# TYPE loco_build_info gauge
+loco_build_info{version="0.1.0 (a1b2c3d)",loco_version="0.16.4",rustc_version="rustc 1.84.0",profile="debug",target="x86_64-unknown-linux-gnu",environment="development"} 1
+# HELP loco_routes_total Number of routes registered in the application.
+# TYPE loco_routes_total gauge
+loco_routes_total 12
+# HELP loco_uptime_seconds Seconds since the server booted.
+# TYPE loco_uptime_seconds gauge
+loco_uptime_seconds 42.5
+# HELP loco_start_time_seconds Unix timestamp of when the server booted.
+# TYPE loco_start_time_seconds gauge
+loco_start_time_seconds 1720000000.0
+```
+
+Loco intentionally does not depend on a metrics backend, so out of the box it emits only a few always-available runtime metrics (build info, route count, uptime, start time). To expose your own application metrics, wire in a metrics registry (e.g. the [`metrics`](https://crates.io/crates/metrics) or [`prometheus`](https://crates.io/crates/prometheus) crates) and render it by overriding `Hooks::metrics`. The returned string is appended to the core metrics and is evaluated on every scrape, so it can be fully dynamic:
+
+```rust
+fn metrics(_ctx: &AppContext) -> String {
+    // Typically rendered from your metrics registry.
+    "# TYPE myapp_active_users gauge\nmyapp_active_users 42\n".to_string()
+}
+```
+
+> Note: like `_server`, `_metrics` exposes internal details and is enabled by default. Guard it with middleware or your ingress if it should not be public.
 
 # Middleware
 
