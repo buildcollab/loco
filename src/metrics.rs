@@ -136,6 +136,40 @@ pub fn render(ctx: &AppContext) -> String {
         }
     }
 
+    // Tokio runtime metrics. These use the stable subset of `RuntimeMetrics`
+    // (no `--cfg tokio_unstable` required). For the richer per-worker counters,
+    // wire the `tokio-metrics` crate in through `Hooks::metrics` (see module
+    // docs). `try_current` keeps this a no-op when rendered outside a Tokio
+    // runtime context.
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let rt = handle.metrics();
+
+        let _ = writeln!(
+            out,
+            "# HELP loco_runtime_workers Number of worker threads used by the Tokio runtime."
+        );
+        let _ = writeln!(out, "# TYPE loco_runtime_workers gauge");
+        let _ = writeln!(out, "loco_runtime_workers {}", rt.num_workers());
+
+        let _ = writeln!(
+            out,
+            "# HELP loco_runtime_alive_tasks Current number of alive tasks in the Tokio runtime."
+        );
+        let _ = writeln!(out, "# TYPE loco_runtime_alive_tasks gauge");
+        let _ = writeln!(out, "loco_runtime_alive_tasks {}", rt.num_alive_tasks());
+
+        let _ = writeln!(
+            out,
+            "# HELP loco_runtime_global_queue_depth Number of tasks currently in the runtime's global queue."
+        );
+        let _ = writeln!(out, "# TYPE loco_runtime_global_queue_depth gauge");
+        let _ = writeln!(
+            out,
+            "loco_runtime_global_queue_depth {}",
+            rt.global_queue_depth()
+        );
+    }
+
     if let Some(hook) = ctx.shared_store.get_ref::<MetricsHook>() {
         let extra = (hook.0)(ctx);
         if !extra.trim().is_empty() {

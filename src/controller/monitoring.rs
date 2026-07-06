@@ -342,6 +342,10 @@ mod tests {
         assert!(text.contains("version=\"1.2.3\""));
         assert!(text.contains("loco_routes_total "));
         assert!(text.contains("loco_uptime_seconds "));
+        // Tokio runtime metrics (stable subset, no `tokio_unstable`).
+        assert!(text.contains("loco_runtime_workers "));
+        assert!(text.contains("loco_runtime_alive_tasks "));
+        assert!(text.contains("loco_runtime_global_queue_depth "));
         // Application-provided metrics are appended.
         assert!(text.contains("myapp_answer 42"));
     }
