@@ -6,11 +6,9 @@
 //! [Prometheus text exposition format][exposition] and appends whatever an
 //! application chooses to expose through
 //! [`Hooks::metrics`](crate::app::Hooks::metrics). This keeps the framework
-//! dependency-free while letting applications wire in a real metrics registry
-//! (e.g. the `metrics` or `prometheus` crates) and render it into the same
-//! endpoint.
+//! dependency-free while letting applications opt into richer metrics.
 //!
-//! The core metrics are:
+//! The core metrics (always emitted) are:
 //!
 //! - `loco_build_info{...}` — a labeled gauge (always `1`) carrying the
 //!   application/framework versions, build profile, target and environment.
@@ -18,7 +16,38 @@
 //! - `loco_uptime_seconds` — seconds since the server booted.
 //! - `loco_start_time_seconds` — unix timestamp of when the server booted.
 //!
+//! # Opt-in metric libraries
+//!
+//! Two dependency-free helpers are provided that an application can plug into
+//! its [`Hooks::metrics`](crate::app::Hooks::metrics) implementation:
+//!
+//! - [`http`] — HTTP request metrics (request counts, a latency histogram, and
+//!   an in-flight gauge) collected by a small Axum middleware.
+//! - [`runtime`] — Tokio runtime metrics (worker count, alive tasks, global
+//!   queue depth) read from the current runtime.
+//!
+//! ```rust,ignore
+//! // In your `App` `Hooks` implementation:
+//! async fn after_routes(router: AxumRouter, ctx: &AppContext) -> Result<AxumRouter> {
+//!     // Install the HTTP metrics collector + middleware.
+//!     let http = loco_rs::metrics::http::HttpMetrics::install(ctx);
+//!     Ok(router.layer(axum::middleware::from_fn_with_state(
+//!         http,
+//!         loco_rs::metrics::http::track,
+//!     )))
+//! }
+//!
+//! fn metrics(ctx: &AppContext) -> String {
+//!     let mut out = loco_rs::metrics::http::render(ctx);
+//!     out.push_str(&loco_rs::metrics::runtime::render());
+//!     out
+//! }
+//! ```
+//!
 //! [exposition]: https://prometheus.io/docs/instrumenting/exposition_formats/
+
+pub mod http;
+pub mod runtime;
 
 use std::{
     fmt::Write,
@@ -66,7 +95,7 @@ impl Default for BootTime {
 pub struct MetricsHook(pub fn(&AppContext) -> String);
 
 /// Escape a string for use as a Prometheus label value.
-fn escape_label(value: &str) -> String {
+pub(crate) fn escape_label(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
         match ch {
@@ -128,46 +157,8 @@ pub fn render(ctx: &AppContext) -> String {
                 "# HELP loco_start_time_seconds Unix timestamp of when the server booted."
             );
             let _ = writeln!(out, "# TYPE loco_start_time_seconds gauge");
-            let _ = writeln!(
-                out,
-                "loco_start_time_seconds {}",
-                since_epoch.as_secs_f64()
-            );
+            let _ = writeln!(out, "loco_start_time_seconds {}", since_epoch.as_secs_f64());
         }
-    }
-
-    // Tokio runtime metrics. These use the stable subset of `RuntimeMetrics`
-    // (no `--cfg tokio_unstable` required). For the richer per-worker counters,
-    // wire the `tokio-metrics` crate in through `Hooks::metrics` (see module
-    // docs). `try_current` keeps this a no-op when rendered outside a Tokio
-    // runtime context.
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        let rt = handle.metrics();
-
-        let _ = writeln!(
-            out,
-            "# HELP loco_runtime_workers Number of worker threads used by the Tokio runtime."
-        );
-        let _ = writeln!(out, "# TYPE loco_runtime_workers gauge");
-        let _ = writeln!(out, "loco_runtime_workers {}", rt.num_workers());
-
-        let _ = writeln!(
-            out,
-            "# HELP loco_runtime_alive_tasks Current number of alive tasks in the Tokio runtime."
-        );
-        let _ = writeln!(out, "# TYPE loco_runtime_alive_tasks gauge");
-        let _ = writeln!(out, "loco_runtime_alive_tasks {}", rt.num_alive_tasks());
-
-        let _ = writeln!(
-            out,
-            "# HELP loco_runtime_global_queue_depth Number of tasks currently in the runtime's global queue."
-        );
-        let _ = writeln!(out, "# TYPE loco_runtime_global_queue_depth gauge");
-        let _ = writeln!(
-            out,
-            "loco_runtime_global_queue_depth {}",
-            rt.global_queue_depth()
-        );
     }
 
     if let Some(hook) = ctx.shared_store.get_ref::<MetricsHook>() {

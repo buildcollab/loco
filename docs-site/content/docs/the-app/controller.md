@@ -384,25 +384,13 @@ loco_uptime_seconds 42.5
 # HELP loco_start_time_seconds Unix timestamp of when the server booted.
 # TYPE loco_start_time_seconds gauge
 loco_start_time_seconds 1720000000.0
-# HELP loco_runtime_workers Number of worker threads used by the Tokio runtime.
-# TYPE loco_runtime_workers gauge
-loco_runtime_workers 8
-# HELP loco_runtime_alive_tasks Current number of alive tasks in the Tokio runtime.
-# TYPE loco_runtime_alive_tasks gauge
-loco_runtime_alive_tasks 3
-# HELP loco_runtime_global_queue_depth Number of tasks currently in the runtime's global queue.
-# TYPE loco_runtime_global_queue_depth gauge
-loco_runtime_global_queue_depth 0
 ```
 
-Loco intentionally does not depend on a metrics backend, so out of the box it emits only a few always-available metrics:
-
-- **Build / server**: `loco_build_info`, `loco_routes_total`, `loco_uptime_seconds`, `loco_start_time_seconds`.
-- **Tokio runtime**: `loco_runtime_workers`, `loco_runtime_alive_tasks`, `loco_runtime_global_queue_depth`. These come from the stable subset of Tokio's [`RuntimeMetrics`](https://docs.rs/tokio/latest/tokio/runtime/struct.RuntimeMetrics.html) (`Handle::metrics()`) — no `--cfg tokio_unstable` required.
+Loco intentionally does not depend on a metrics backend, so the core endpoint emits only a few always-available metrics (`loco_build_info`, `loco_routes_total`, `loco_uptime_seconds`, `loco_start_time_seconds`).
 
 #### Adding your own metrics
 
-To expose application, richer runtime, or HTTP metrics, wire in a metrics registry and render it by overriding `Hooks::metrics`. The returned string is appended to the core metrics and is evaluated on every scrape, so it can be fully dynamic:
+Override `Hooks::metrics` to append your own metrics. The returned string is added to the core metrics and is evaluated on every scrape, so it can be fully dynamic:
 
 ```rust
 fn metrics(_ctx: &AppContext) -> String {
@@ -411,10 +399,35 @@ fn metrics(_ctx: &AppContext) -> String {
 }
 ```
 
-Common backends that render straight into this hook:
+#### Built-in metric helpers
 
-- **HTTP request metrics** (request counts, latency histograms, in-flight): [`axum-prometheus`](https://crates.io/crates/axum-prometheus) gives you an axum `Layer` plus a `PrometheusHandle`. Add the layer in `Hooks::after_routes`, stash the handle (e.g. in the `SharedStore`), and return `handle.render()` from `Hooks::metrics`. This builds on the [`metrics`](https://crates.io/crates/metrics) facade + [`metrics-exporter-prometheus`](https://crates.io/crates/metrics-exporter-prometheus), which you can also drive directly from your own middleware/handlers.
-- **Full Tokio runtime & per-task metrics**: [`tokio-metrics`](https://crates.io/crates/tokio-metrics) (`RuntimeMonitor` / `TaskMonitor`). Note the detailed counters require building the app with `RUSTFLAGS="--cfg tokio_unstable"` (a build flag, not a cargo feature), so Loco cannot enable them for you — add it to your app's `.cargo/config.toml`.
+Loco ships two dependency-free helper libraries in `loco_rs::metrics` that plug straight into this hook — no extra crates, no build flags:
+
+- [`loco_rs::metrics::http`](https://docs.rs/loco-rs/latest/loco_rs/metrics/http/index.html) — HTTP request metrics: request counts, a latency histogram, and an in-flight gauge, labeled by method, matched route path, and status. It's a small Axum middleware plus a renderer.
+- [`loco_rs::metrics::runtime`](https://docs.rs/loco-rs/latest/loco_rs/metrics/runtime/index.html) — Tokio runtime metrics (`loco_runtime_workers`, `loco_runtime_alive_tasks`, `loco_runtime_global_queue_depth`) from the stable subset of `RuntimeMetrics`.
+
+Install the HTTP collector + middleware in `after_routes`, then render both from `metrics`:
+
+```rust
+async fn after_routes(router: AxumRouter, ctx: &AppContext) -> Result<AxumRouter> {
+    let http = loco_rs::metrics::http::HttpMetrics::install(ctx);
+    Ok(router.layer(axum::middleware::from_fn_with_state(
+        http,
+        loco_rs::metrics::http::track,
+    )))
+}
+
+fn metrics(ctx: &AppContext) -> String {
+    let mut out = loco_rs::metrics::http::render(ctx);
+    out.push_str(&loco_rs::metrics::runtime::render());
+    out
+}
+```
+
+For metrics beyond these, render any Prometheus-formatted string into the same hook:
+
+- **HTTP metrics via the `metrics` ecosystem**: [`axum-prometheus`](https://crates.io/crates/axum-prometheus) (built on the [`metrics`](https://crates.io/crates/metrics) facade + [`metrics-exporter-prometheus`](https://crates.io/crates/metrics-exporter-prometheus)) — add its `Layer`, stash the `PrometheusHandle`, and return `handle.render()`.
+- **Full Tokio runtime & per-task metrics**: [`tokio-metrics`](https://crates.io/crates/tokio-metrics) (`RuntimeMonitor` / `TaskMonitor`). The detailed counters require building the app with `RUSTFLAGS="--cfg tokio_unstable"` (a build flag, not a cargo feature), so Loco cannot enable them for you — add it to your app's `.cargo/config.toml`.
 
 > Note: like `_server`, `_metrics` exposes internal details and is enabled by default. Guard it with middleware or your ingress if it should not be public.
 
