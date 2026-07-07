@@ -20,7 +20,7 @@ cargo_metadata = "0.23"
 requestty = "0.6"
 regex = { version = "1.12" }
 thiserror = "2"
-tabled = "0.20"
+tabled = "0.21"
 colored = { version = "3.1" }
 
 [dev-dependencies]

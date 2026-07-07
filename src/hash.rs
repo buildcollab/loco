@@ -3,7 +3,7 @@ use argon2::{
     password_hash::{rand_core::OsRng, SaltString},
     Argon2, Params, PasswordHash, PasswordHasher, PasswordVerifier, Version,
 };
-use rand::{distr::Alphanumeric, rng, Rng};
+use rand::{distr::Alphanumeric, rng, RngExt};
 
 /// Hashes a plain text password and returns the hashed result.
 ///
@@ -71,7 +71,7 @@ pub fn verify_password(pass: &str, hashed_password: &str) -> bool {
 /// ```
 pub fn random_string(length: usize) -> String {
     rng()
-        .sample_iter(&Alphanumeric)
+        .sample_iter(Alphanumeric)
         .take(length)
         .map(char::from)
         .collect()

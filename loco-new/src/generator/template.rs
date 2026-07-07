@@ -6,14 +6,14 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use rand::{distributions::Alphanumeric, rngs::StdRng, Rng, SeedableRng};
+use rand::{distr::Alphanumeric, rngs::StdRng, RngExt, SeedableRng};
 use tera::{Context, Tera};
 
 use crate::settings::Settings;
 
 const TEMPLATE_EXTENSION: &str = "t";
 
-fn generate_random_string<R: Rng>(rng: &mut R, length: u64) -> String {
+fn generate_random_string<R: RngExt>(rng: &mut R, length: u64) -> String {
     (0..length)
         .map(|_| rng.sample(Alphanumeric) as char)
         .collect()
@@ -30,7 +30,7 @@ impl Default for Template {
         #[cfg(test)]
         let rng = StdRng::seed_from_u64(42);
         #[cfg(not(test))]
-        let rng = StdRng::from_entropy();
+        let rng = StdRng::from_rng(&mut rand::rng());
         Self {
             rng: Arc::new(Mutex::new(rng)),
         }
@@ -68,7 +68,7 @@ impl Template {
                     if let Some(length) = length.as_u64() {
                         let rand_str: String = rng_clone.lock().map_or_else(
                             |_| {
-                                let mut r = StdRng::from_entropy();
+                                let mut r = StdRng::from_rng(&mut rand::rng());
                                 generate_random_string(&mut r, length)
                             },
                             |mut rng| generate_random_string(&mut *rng, length),

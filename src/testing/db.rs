@@ -100,7 +100,7 @@ impl TestSupport for PostgresTest {
                 .expect("db connection should success");
             let query = format!("CREATE DATABASE {};", self.schema_name);
 
-            sqlx::query(&query)
+            sqlx::query(sqlx::AssertSqlSafe(query))
                 .execute(&pool)
                 .await
                 .expect("create DB schema");
@@ -119,7 +119,7 @@ impl TestSupport for PostgresTest {
                     .await
                     .expect("db connection should success");
                 let query = format!("drop database if exists {table_name};");
-                sqlx::query(&query)
+                sqlx::query(sqlx::AssertSqlSafe(query))
                     .execute(&pool)
                     .await
                     .expect("Drop database");
