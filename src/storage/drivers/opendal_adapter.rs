@@ -105,7 +105,7 @@ impl StoreDriver for OpendalAdapter {
         let from = from.display().to_string();
         let to = to.display().to_string();
         if self.opendal_impl.info().full_capability().copy {
-            Ok(self.opendal_impl.copy(&from, &to).await?)
+            self.opendal_impl.copy(&from, &to).await?;
         } else {
             let mut reader = self
                 .opendal_impl
@@ -122,8 +122,8 @@ impl StoreDriver for OpendalAdapter {
                 .close()
                 .await
                 .map_err(|err| StorageError::Any(Box::new(err)))?;
-            Ok(())
         }
+        Ok(())
     }
 
     /// Checks if the content exists at the specified path in the object store.

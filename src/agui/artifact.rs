@@ -333,7 +333,13 @@ mod tests {
             Ok(a.clone())
         }
         async fn get(&self, pid: &str) -> Result<Option<Artifact>> {
-            Ok(self.0.lock().unwrap().iter().find(|a| a.pid == pid).cloned())
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|a| a.pid == pid)
+                .cloned())
         }
         async fn list(&self, tag: Option<&str>) -> Result<Vec<Artifact>> {
             Ok(self
@@ -378,7 +384,10 @@ mod tests {
         let pid = created["pid"].as_str().unwrap().to_string();
         assert_eq!(created["version"], 1);
 
-        let listed = tools.execute(&ctx, "list_artifacts", json!({})).await.unwrap();
+        let listed = tools
+            .execute(&ctx, "list_artifacts", json!({}))
+            .await
+            .unwrap();
         assert_eq!(listed["artifacts"].as_array().unwrap().len(), 1);
 
         // Filtered list by a tag that does not exist yet.
@@ -389,7 +398,11 @@ mod tests {
         assert_eq!(none["artifacts"].as_array().unwrap().len(), 0);
 
         let tagged = tools
-            .execute(&ctx, "tag_artifact", json!({ "pid": pid, "tags": ["published"] }))
+            .execute(
+                &ctx,
+                "tag_artifact",
+                json!({ "pid": pid, "tags": ["published"] }),
+            )
             .await
             .unwrap();
         let tags: Vec<&str> = tagged["tags"]

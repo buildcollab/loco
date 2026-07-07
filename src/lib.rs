@@ -1,5 +1,8 @@
 #![allow(clippy::missing_const_for_fn)]
 #![allow(clippy::module_name_repetitions)]
+// `doc_markdown` is noisy on the product names used throughout the docs and
+// README (OpenDAL, OpenRouter, WebSocket, GCS, …); allow it crate-wide.
+#![allow(clippy::doc_markdown)]
 #![doc = include_str!("../README.md")]
 
 pub use self::errors::Error;

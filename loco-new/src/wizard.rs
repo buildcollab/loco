@@ -275,7 +275,7 @@ where
     let selection = Select::with_theme(&ColorfulTheme::default())
         .with_prompt(text)
         .default(0)
-        .items(options)
+        .items(options.iter().map(ToString::to_string))
         .interact()?;
     Ok(options.get(selection).cloned().unwrap_or_default())
 }

@@ -47,7 +47,11 @@ pub fn render() -> String {
         "# HELP loco_runtime_alive_tasks Current number of alive tasks in the Tokio runtime."
     );
     let _ = writeln!(out, "# TYPE loco_runtime_alive_tasks gauge");
-    let _ = writeln!(out, "loco_runtime_alive_tasks {}", metrics.num_alive_tasks());
+    let _ = writeln!(
+        out,
+        "loco_runtime_alive_tasks {}",
+        metrics.num_alive_tasks()
+    );
 
     let _ = writeln!(
         out,

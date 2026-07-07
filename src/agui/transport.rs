@@ -112,7 +112,6 @@ pub fn sse_response(
 /// Serialize a numbered [`HubEvent`] into an SSE [`Event`], setting the SSE
 /// `id:` to the per-run sequence number. A reconnecting client echoes the last
 /// id it saw (as `Last-Event-ID` / a `since` query) to resume without gaps.
-#[must_use]
 pub fn hub_event_to_sse(ev: &HubEvent) -> Event {
     Event::default()
         .id(ev.seq.to_string())
