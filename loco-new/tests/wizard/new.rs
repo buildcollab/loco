@@ -213,7 +213,11 @@ impl Tester {
             "-W",
             "rust-2018-idioms",
             "-A",
-            "clippy::result_large_err"
+            "clippy::result_large_err",
+            // The generated CLI future is large by nature (full app boot); the
+            // exact size is dependency-sensitive and can cross the threshold.
+            "-A",
+            "clippy::large_futures"
         )
         .full_env(&self.env_map)
         // .stdout_null()
