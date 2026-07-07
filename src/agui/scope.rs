@@ -104,7 +104,7 @@ mod tests {
     use sea_orm::{DatabaseBackend, EntityTrait, QueryFilter, QueryTrait};
     use serde_json::json;
 
-    use super::{conversations, contains};
+    use super::{contains, conversations};
 
     #[test]
     fn contains_builds_jsonb_containment_sql() {
@@ -114,6 +114,9 @@ mod tests {
             .build(DatabaseBackend::Postgres)
             .to_string();
         assert!(sql.contains("@>"), "expected JSONB containment, got: {sql}");
-        assert!(sql.contains("scope"), "should filter the scope column: {sql}");
+        assert!(
+            sql.contains("scope"),
+            "should filter the scope column: {sql}"
+        );
     }
 }

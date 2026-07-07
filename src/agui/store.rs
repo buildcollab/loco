@@ -520,7 +520,11 @@ impl MemoryStore for DbMemoryStore {
             })
             .filter(|h| h.score > 0.0)
             .collect();
-        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         scored.truncate(top_k.max(1));
         Ok(scored)
     }
@@ -530,7 +534,12 @@ impl MemoryStore for DbMemoryStore {
 mod tests {
     use super::*;
 
-    fn msg(role: &str, status: Option<&str>, parts: Option<Value>, content: Option<&str>) -> messages::Model {
+    fn msg(
+        role: &str,
+        status: Option<&str>,
+        parts: Option<Value>,
+        content: Option<&str>,
+    ) -> messages::Model {
         messages::Model {
             id: 1,
             pid: Uuid::nil(),
@@ -549,7 +558,12 @@ mod tests {
     fn skips_the_fresh_streaming_placeholder() {
         // `run_turn` inserts this (status "streaming", no parts, no content)
         // before `load_history`; replaying it injects an empty assistant turn.
-        assert!(is_empty_streaming(&msg("assistant", Some("streaming"), None, None)));
+        assert!(is_empty_streaming(&msg(
+            "assistant",
+            Some("streaming"),
+            None,
+            None
+        )));
         // An empty `parts` array is just as empty as a missing one.
         assert!(is_empty_streaming(&msg(
             "assistant",
@@ -605,8 +619,18 @@ mod tests {
     fn keeps_completed_and_empty_rows() {
         // Completed rows are never touched, even when empty (a model that
         // genuinely returned nothing).
-        assert!(!is_empty_streaming(&msg("assistant", Some("complete"), None, Some(""))));
-        assert!(!is_empty_streaming(&msg("user", Some("complete"), None, Some("hi"))));
+        assert!(!is_empty_streaming(&msg(
+            "assistant",
+            Some("complete"),
+            None,
+            Some("")
+        )));
+        assert!(!is_empty_streaming(&msg(
+            "user",
+            Some("complete"),
+            None,
+            Some("hi")
+        )));
         // A streaming row that already streamed some text stays.
         assert!(!is_empty_streaming(&msg(
             "assistant",

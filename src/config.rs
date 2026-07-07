@@ -570,18 +570,17 @@ pub struct ProviderSettings {
 impl ProviderConfig {
     /// The shared settings regardless of variant.
     #[must_use]
-    pub fn settings(&self) -> &ProviderSettings {
+    pub const fn settings(&self) -> &ProviderSettings {
         match self {
-            Self::Openrouter(s)
-            | Self::Openai(s)
-            | Self::OpenaiCompatible(s)
-            | Self::Stub(s) => s,
+            Self::Openrouter(s) | Self::Openai(s) | Self::OpenaiCompatible(s) | Self::Stub(s) => s,
         }
     }
 }
 
 /// Run-hub backend: where per-run events are buffered and cancellation is
-/// coordinated. In-memory is single-process; the DB-backed variants support
+/// coordinated.
+///
+/// In-memory is single-process; the DB-backed variants support
 /// multi-node deploys (replay from a table, live fan-out via `cable`).
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(tag = "kind", rename_all = "snake_case")]

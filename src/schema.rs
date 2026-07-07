@@ -573,6 +573,9 @@ async fn create_table_impl(
     // Create enum types automatically if they don't exist
     let mut enum_types = std::collections::HashSet::new();
     for (_, col_type) in cols {
+        // The membership `if` guards a large body; a match guard would be
+        // equivalent but less readable, so keep the explicit `if`.
+        #[allow(clippy::collapsible_match)]
         match col_type {
             ColType::Enum(enum_name, variants)
             | ColType::EnumNull(enum_name, variants)

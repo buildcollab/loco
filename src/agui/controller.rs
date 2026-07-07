@@ -93,8 +93,7 @@ async fn find_conversation(
     filter: Option<&Condition>,
 ) -> Result<conversations::Model> {
     let uuid = Uuid::parse_str(pid).map_err(|e| Error::Message(e.to_string()))?;
-    let mut query =
-        conversations::Entity::find().filter(conversations::Column::Pid.eq(uuid));
+    let mut query = conversations::Entity::find().filter(conversations::Column::Pid.eq(uuid));
     if let Some(cond) = filter {
         query = query.filter(cond.clone());
     }
@@ -406,10 +405,7 @@ pub fn routes(registry: Arc<AgentRegistry>) -> Routes {
 /// every conversation read, so a request cannot reach a conversation outside its
 /// scope.
 #[must_use]
-pub fn routes_with_scope(
-    registry: Arc<AgentRegistry>,
-    scope: Arc<dyn ScopeResolver>,
-) -> Routes {
+pub fn routes_with_scope(registry: Arc<AgentRegistry>, scope: Arc<dyn ScopeResolver>) -> Routes {
     Routes::new()
         .prefix("api/")
         .add("agents", get(list_agents))

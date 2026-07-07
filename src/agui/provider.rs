@@ -176,13 +176,10 @@ pub fn history_from_parts(
                         .get("toolCallId")
                         .and_then(Value::as_str)
                         .unwrap_or_default();
-                    let content = part.get("content").map_or_else(
-                        || String::new(),
-                        |c| {
-                            c.as_str()
-                                .map_or_else(|| c.to_string(), ToString::to_string)
-                        },
-                    );
+                    let content = part.get("content").map_or_else(String::new, |c| {
+                        c.as_str()
+                            .map_or_else(|| c.to_string(), ToString::to_string)
+                    });
                     tool_results.push(ChatMessage::tool_result(id, &content));
                 }
                 _ => {}
@@ -1690,13 +1687,19 @@ mod tests {
     #[test]
     fn response_format_wraps_schema_when_set() {
         let base = RigProvider::new("k", None, "m");
-        assert!(base.build_body("s", &[], &[]).get("response_format").is_none());
+        assert!(base
+            .build_body("s", &[], &[])
+            .get("response_format")
+            .is_none());
 
         let schema = json!({ "type": "object", "properties": { "title": { "type": "string" } } });
         let structured = RigProvider::new("k", None, "m").with_response_format(schema.clone());
         let body = structured.build_body("s", &[], &[]);
         assert_eq!(body["response_format"]["type"], "json_schema");
-        assert_eq!(body["response_format"]["json_schema"]["strict"], json!(true));
+        assert_eq!(
+            body["response_format"]["json_schema"]["strict"],
+            json!(true)
+        );
         assert_eq!(body["response_format"]["json_schema"]["schema"], schema);
     }
 

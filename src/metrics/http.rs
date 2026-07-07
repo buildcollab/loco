@@ -180,6 +180,7 @@ impl HttpMetrics {
                 out,
                 "loco_http_request_duration_seconds_bucket{{{labels},le=\"+Inf\"}} {cumulative}"
             );
+            #[allow(clippy::cast_precision_loss)]
             let sum_seconds = entry.sum_nanos.load(Ordering::Relaxed) as f64 / 1_000_000_000.0;
             let _ = writeln!(
                 out,
@@ -216,11 +217,10 @@ pub async fn track(State(metrics): State<Arc<HttpMetrics>>, req: Request, next: 
     metrics.in_flight.fetch_add(1, Ordering::Relaxed);
 
     let method = req.method().as_str().to_owned();
-    let path = req
-        .extensions()
-        .get::<MatchedPath>()
-        .map(|matched| matched.as_str().to_owned())
-        .unwrap_or_else(|| req.uri().path().to_owned());
+    let path = req.extensions().get::<MatchedPath>().map_or_else(
+        || req.uri().path().to_owned(),
+        |matched| matched.as_str().to_owned(),
+    );
 
     let start = Instant::now();
     let response = next.run(req).await;

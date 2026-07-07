@@ -739,29 +739,29 @@ where
                 ("success", r)
             } else {
                 match authz.authorize(&call, kind).await? {
-                ToolDecision::Deny { reason } => {
-                    let denied = json!({ "denied": true, "reason": reason });
-                    store
-                        .complete_tool_call(&tref, "denied", &denied, 0)
+                    ToolDecision::Deny { reason } => {
+                        let denied = json!({ "denied": true, "reason": reason });
+                        store
+                            .complete_tool_call(&tref, "denied", &denied, 0)
+                            .await?;
+                        ("denied", denied)
+                    }
+                    // An approved call is already past its approval gate, so treat a
+                    // repeated `RequireApproval` as an allow rather than looping.
+                    ToolDecision::Allow | ToolDecision::RequireApproval { .. } => {
+                        params.hooks.before_tool(&ctx, &call).await?;
+                        let (s, r) = execute_and_record(
+                            &exec,
+                            store,
+                            &tref,
+                            &call,
+                            &params.tool_ctx,
+                            params.tool_timeout,
+                        )
                         .await?;
-                    ("denied", denied)
-                }
-                // An approved call is already past its approval gate, so treat a
-                // repeated `RequireApproval` as an allow rather than looping.
-                ToolDecision::Allow | ToolDecision::RequireApproval { .. } => {
-                    params.hooks.before_tool(&ctx, &call).await?;
-                    let (s, r) = execute_and_record(
-                        &exec,
-                        store,
-                        &tref,
-                        &call,
-                        &params.tool_ctx,
-                        params.tool_timeout,
-                    )
-                    .await?;
-                    params.hooks.after_tool(&ctx, &call, &r).await?;
-                    (s, r)
-                }
+                        params.hooks.after_tool(&ctx, &call, &r).await?;
+                        (s, r)
+                    }
                 }
             };
             parts.push(part_tool_use(&call.id, &call.name, &call.arguments));
@@ -2013,7 +2013,10 @@ mod tests {
         let resume_sink = VecSink::default();
         let item = ResumeItem {
             interrupt_id: "call_stub_save_note".to_string(),
-            payload: ResumePayload { approved: true, input: None },
+            payload: ResumePayload {
+                approved: true,
+                input: None,
+            },
         };
         resume(
             &store,
@@ -2063,7 +2066,10 @@ mod tests {
         let resume_sink = VecSink::default();
         let item = ResumeItem {
             interrupt_id: "call_stub_save_note".to_string(),
-            payload: ResumePayload { approved: false, input: None },
+            payload: ResumePayload {
+                approved: false,
+                input: None,
+            },
         };
         resume(
             &store,
@@ -2288,7 +2294,10 @@ mod tests {
         let resume_sink = VecSink::default();
         let item = ResumeItem {
             interrupt_id: "del_1".to_string(),
-            payload: ResumePayload { approved: true, input: None },
+            payload: ResumePayload {
+                approved: true,
+                input: None,
+            },
         };
         resume_with_subagents(
             &store,
@@ -2342,7 +2351,10 @@ mod tests {
         let resume_sink = VecSink::default();
         let item = ResumeItem {
             interrupt_id: "del_1".to_string(),
-            payload: ResumePayload { approved: false, input: None },
+            payload: ResumePayload {
+                approved: false,
+                input: None,
+            },
         };
         resume_with_subagents(
             &store,

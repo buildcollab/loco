@@ -51,12 +51,12 @@ use super::hub::{run_hub, HubSink};
 use super::interact::builtin_interact_tools;
 use super::memory::builtin_memory_tools;
 use super::protocol::{AguiEvent, RunAgentInput};
-use super::state_tool::builtin_state_tools;
-use super::transport::EventSink;
 use super::runtime::{resume, run_turn, ConversationStore, RunParams};
 use super::service;
+use super::state_tool::builtin_state_tools;
 use super::store::{DbArtifactStore, DbMemoryStore, DbStore};
 use super::subagent::CompositeToolExecutor;
+use super::transport::EventSink;
 use crate::app::AppContext;
 use crate::bgworker::BackgroundWorker;
 use crate::config::{ExecutionConfig, WorkerMode};
@@ -224,7 +224,16 @@ pub async fn execute(
     };
 
     let result = if let Some(item) = args.input.resume.first().cloned() {
-        resume(&store, tools, &provider, sink.as_ref(), &params, &authz, &item).await
+        resume(
+            &store,
+            tools,
+            &provider,
+            sink.as_ref(),
+            &params,
+            &authz,
+            &item,
+        )
+        .await
     } else {
         run_turn(&store, tools, &provider, sink.as_ref(), &params, &authz).await
     };
@@ -494,7 +503,10 @@ mod tests {
             message: None,
             resume: vec![ResumeItem {
                 interrupt_id: "i1".to_string(),
-                payload: ResumePayload { approved: true, input: None },
+                payload: ResumePayload {
+                    approved: true,
+                    input: None,
+                },
             }],
         };
         seed_turn(&store, &resume).await.unwrap();

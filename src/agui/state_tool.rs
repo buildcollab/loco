@@ -131,9 +131,10 @@ impl Tool for SetState {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "set_state".to_string(),
-            description: "Replace the conversation's shared state object entirely. Streams a state \
+            description:
+                "Replace the conversation's shared state object entirely. Streams a state \
                           snapshot to the UI."
-                .to_string(),
+                    .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": { "state": { "type": "object", "description": "The new state object." } },

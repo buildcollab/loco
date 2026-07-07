@@ -110,8 +110,7 @@ pub async fn find_conversation(
     filter: Option<Condition>,
 ) -> Result<conversations::Model> {
     let uuid = Uuid::parse_str(pid).map_err(|e| Error::Message(e.to_string()))?;
-    let mut query =
-        conversations::Entity::find().filter(conversations::Column::Pid.eq(uuid));
+    let mut query = conversations::Entity::find().filter(conversations::Column::Pid.eq(uuid));
     if let Some(cond) = filter {
         query = query.filter(cond);
     }

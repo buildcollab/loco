@@ -283,7 +283,10 @@ where
         let params = self.params(ctx, false);
         let item = ResumeItem {
             interrupt_id: pending.tool_call_id.clone(),
-            payload: ResumePayload { approved, input: None },
+            payload: ResumePayload {
+                approved,
+                input: None,
+            },
         };
         resume(
             &store,
