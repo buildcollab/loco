@@ -66,6 +66,16 @@ agui = ["dep:reqwest", "tokio/sync", "tokio/rt", "tokio/macros", "tokio/time"]
 integration_test = []
 # Embed assets into binary
 embedded_assets = []
+# OpenTelemetry metrics: a MeterProvider bridged from `tracing` events
+# (tracing-opentelemetry) and exported for Prometheus scraping
+# (opentelemetry-prometheus). Opt-in; the default build stays dependency-free.
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-prometheus",
+    "dep:tracing-opentelemetry",
+    "dep:prometheus",
+]
 
 [dependencies]
 loco-gen = { version = "0.16.1", path = "./loco-gen" }
@@ -186,6 +196,11 @@ reqwest = { version = "0.13.4", default-features = false, features = [
 
 dashmap = "6"
 notify = "8.2"
+opentelemetry = { version = "0.32.0", optional = true }
+opentelemetry_sdk = { version = "0.32.1", optional = true }
+opentelemetry-prometheus = { version = "0.32.0", optional = true }
+tracing-opentelemetry = { version = "0.33.0", optional = true }
+prometheus = { version = "0.14.0", optional = true }
 
 [workspace.dependencies]
 # NOTE: pinned to 1.x. tera 2.0 is available but `rrgen` (used by loco-gen for
