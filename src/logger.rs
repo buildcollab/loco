@@ -104,6 +104,16 @@ static NONBLOCKING_WORK_GUARD_KEEP: OnceLock<WorkerGuard> = OnceLock::new();
 pub fn init<H: Hooks>(config: &config::Logger) -> Result<()> {
     let mut layers: Vec<Box<dyn Layer<Registry> + Sync + Send>> = Vec::new();
 
+    // Initialize the OpenTelemetry meter provider and bridge `tracing` metric
+    // events into it via a `MetricsLayer`.
+    #[cfg(feature = "otel")]
+    {
+        crate::metrics::otel::init()?;
+        if let Some(otel_layer) = crate::metrics::otel::tracing_layer() {
+            layers.push(otel_layer);
+        }
+    }
+
     if let Some(file_appender_config) = config.file_appender.as_ref() {
         if file_appender_config.enable {
             let dir = file_appender_config

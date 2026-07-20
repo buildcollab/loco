@@ -500,6 +500,12 @@ async fn setup_routes<H: Hooks>(
     app_context: &AppContext,
     initializers: &[Box<dyn Initializer>],
 ) -> Result<Router> {
+    // Ensure the OpenTelemetry pipeline is initialized before any routes or the
+    // application's `after_routes` (which may install HTTP metrics) run, even if
+    // the app overrode `init_logger`.
+    #[cfg(feature = "otel")]
+    crate::metrics::otel::init()?;
+
     let app = H::before_routes(app_context).await?;
     let app_routes = H::routes(app_context);
 

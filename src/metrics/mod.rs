@@ -47,6 +47,8 @@
 //! [exposition]: https://prometheus.io/docs/instrumenting/exposition_formats/
 
 pub mod http;
+#[cfg(feature = "otel")]
+pub mod otel;
 pub mod runtime;
 
 use std::{
@@ -158,6 +160,17 @@ pub fn render(ctx: &AppContext) -> String {
             );
             let _ = writeln!(out, "# TYPE loco_start_time_seconds gauge");
             let _ = writeln!(out, "loco_start_time_seconds {}", since_epoch.as_secs_f64());
+        }
+    }
+
+    // When the `otel` feature is enabled, append the OpenTelemetry-collected
+    // metrics (HTTP instruments, `tracing` metric events, and any application
+    // instruments on the global meter) rendered from the Prometheus registry.
+    #[cfg(feature = "otel")]
+    if let Some(text) = otel::render() {
+        if !text.trim().is_empty() {
+            out.push_str(text.trim_end());
+            out.push('\n');
         }
     }
 

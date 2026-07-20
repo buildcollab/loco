@@ -424,7 +424,45 @@ fn metrics(ctx: &AppContext) -> String {
 }
 ```
 
-For metrics beyond these, render any Prometheus-formatted string into the same hook:
+#### OpenTelemetry (feature `otel`)
+
+For a future-proof, vendor-neutral pipeline, enable the `otel` feature. Loco then wires up an OpenTelemetry `MeterProvider` backed by an [`opentelemetry-prometheus`](https://crates.io/crates/opentelemetry-prometheus) exporter, installs a [`tracing-opentelemetry`](https://crates.io/crates/tracing-opentelemetry) `MetricsLayer`, and renders the collected metrics on `/_metrics` — all appended alongside the core metrics:
+
+```toml
+# Cargo.toml
+loco-rs = { version = "*", features = ["otel"] }
+```
+
+With the feature on:
+
+- **Emit metrics from `tracing` events** — the `MetricsLayer` bridge records them to OpenTelemetry:
+
+  ```rust
+  tracing::info!(monotonic_counter.orders_placed = 1_u64, tier = "pro");
+  tracing::info!(histogram.job_duration_seconds = elapsed.as_secs_f64());
+  ```
+
+- **HTTP request metrics** — attach the provided middleware, which records to native OpenTelemetry instruments (so it is not affected by log-level filtering). The series appear on `/_metrics` automatically:
+
+  ```rust
+  async fn after_routes(router: AxumRouter, ctx: &AppContext) -> Result<AxumRouter> {
+      let http = loco_rs::metrics::otel::HttpMetrics::install(ctx);
+      Ok(router.layer(axum::middleware::from_fn_with_state(
+          http,
+          loco_rs::metrics::otel::track,
+      )))
+  }
+  ```
+
+- **Any OpenTelemetry instrument** you create on the global meter (`opentelemetry::global::meter(..)`) is exported too.
+
+Since the exporter is a pull exporter feeding the same `/_metrics` endpoint, Prometheus scraping is unchanged — you're just swapping the collection layer underneath. To push via OTLP to a collector instead, add an OTLP exporter to the provider in your own initializer.
+
+> OpenTelemetry pulls in a large dependency tree, which is why it's opt-in. Without the `otel` feature, the dependency-free `metrics::http` / `metrics::runtime` helpers above remain available.
+
+#### Other backends
+
+You can also render any Prometheus-formatted string into the hook directly:
 
 - **HTTP metrics via the `metrics` ecosystem**: [`axum-prometheus`](https://crates.io/crates/axum-prometheus) (built on the [`metrics`](https://crates.io/crates/metrics) facade + [`metrics-exporter-prometheus`](https://crates.io/crates/metrics-exporter-prometheus)) — add its `Layer`, stash the `PrometheusHandle`, and return `handle.render()`.
 - **Full Tokio runtime & per-task metrics**: [`tokio-metrics`](https://crates.io/crates/tokio-metrics) (`RuntimeMonitor` / `TaskMonitor`). The detailed counters require building the app with `RUSTFLAGS="--cfg tokio_unstable"` (a build flag, not a cargo feature), so Loco cannot enable them for you — add it to your app's `.cargo/config.toml`.
